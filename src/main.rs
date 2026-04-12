@@ -29,7 +29,7 @@ fn main() {
 
     let sketch_cmd = Command::new(params::CMD_SKETCH)
         .version("0.1.0")
-        .about("Sketch genome FASTA files into DotANI sketches")
+        .about("Sketch genome FASTA files into DotHash and UltraLogLog sketches")
         .arg(
             Arg::new("path")
                 .short('p')
@@ -386,7 +386,7 @@ fn main() {
 
     let matches = Command::new("dotani")
         .version(params::VERSION)
-        .about("DotANI: Fast and memory-efficient ANI estimation in hyperdimensional space")
+        .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and UltraLogLog, with GPU acceleration")
         .arg_required_else_help(true)
         .subcommand_required(true)
         .subcommand(sketch_cmd)
