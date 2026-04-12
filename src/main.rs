@@ -28,6 +28,7 @@ fn main() {
     init_log();
 
     let sketch_cmd = Command::new(params::CMD_SKETCH)
+        .version("0.1.0")
         .about("Sketch genome FASTA files into DotANI sketches")
         .arg(
             Arg::new("path")
