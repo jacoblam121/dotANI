@@ -24,6 +24,10 @@ fn init_log() {
         .init();
 }
 
+fn ull_path_from_sketch_path(p: &PathBuf) -> PathBuf {
+    PathBuf::from(format!("{}.ull", p.to_string_lossy()))
+}
+
 fn main() {
     init_log();
 
@@ -119,14 +123,6 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("ull_out")
-                .long("ull-out")
-                .help("Output UltraLogLog sketch file")
-                .required(false)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("hv_d")
                 .short('d')
                 .long("hv-d")
@@ -179,22 +175,6 @@ fn main() {
                 .short('q')
                 .long("path-q")
                 .help("Path to query DotHash sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("path_r_ull")
-                .long("path-r-ull")
-                .help("Path to reference UltraLogLog sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("path_q_ull")
-                .long("path-q-ull")
-                .help("Path to query UltraLogLog sketch file")
                 .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
@@ -435,12 +415,14 @@ fn main() {
         .get_matches();
 
     if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
+        let out_file = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
+
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
             path: sketch_m.get_one::<PathBuf>("path").cloned().unwrap(),
             path_ref_sketch: PathBuf::new(),
             path_query_sketch: PathBuf::new(),
-            out_file: sketch_m.get_one::<PathBuf>("out").cloned().unwrap(),
+            out_file: out_file.clone(),
             ksize: *sketch_m.get_one::<u8>("ksize").unwrap(),
             sketch_method: sketch_m
                 .get_one::<String>("sketch_method")
@@ -457,14 +439,7 @@ fn main() {
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
             if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
-            ull_out_file: sketch_m
-                .get_one::<PathBuf>("ull_out")
-                .cloned()
-                .unwrap_or_else(|| {
-                    let mut p = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
-                    p.set_extension("ull");
-                    p
-                }),
+            ull_out_file: ull_path_from_sketch_path(&out_file),
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
         };
@@ -482,11 +457,14 @@ fn main() {
             sketch::sketch(sketch_params);
         }
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
+        let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
+        let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
+
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
             path: PathBuf::new(),
-            path_ref_sketch: dist_m.get_one::<PathBuf>("path_r").cloned().unwrap(),
-            path_query_sketch: dist_m.get_one::<PathBuf>("path_q").cloned().unwrap(),
+            path_ref_sketch: path_ref_sketch.clone(),
+            path_query_sketch: path_query_sketch.clone(),
             out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
             ksize: *dist_m.get_one::<u8>("ksize").unwrap(),
             sketch_method: dist_m
@@ -505,8 +483,8 @@ fn main() {
             if_ull: true,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
-            path_ref_ull: dist_m.get_one::<PathBuf>("path_r_ull").cloned().unwrap(),
-            path_query_ull: dist_m.get_one::<PathBuf>("path_q_ull").cloned().unwrap(),
+            path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
+            path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
         };
 
         rayon::ThreadPoolBuilder::new()
@@ -517,20 +495,23 @@ fn main() {
         let mut sketch_dist = types::SketchDist::new(&cli_params);
         dist::dist(&mut sketch_dist);
     } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
+        let path_ref_sketch = search_m
+            .get_one::<PathBuf>("path_r")
+            .cloned()
+            .unwrap_or_default();
+        let path_query_sketch = search_m
+            .get_one::<PathBuf>("path_q")
+            .cloned()
+            .unwrap_or_default();
+
         let cli_params = types::CliParams {
             mode: params::CMD_SEARCH.to_string(),
             path: search_m
                 .get_one::<PathBuf>("path")
                 .cloned()
                 .unwrap_or_default(),
-            path_ref_sketch: search_m
-                .get_one::<PathBuf>("path_r")
-                .cloned()
-                .unwrap_or_default(),
-            path_query_sketch: search_m
-                .get_one::<PathBuf>("path_q")
-                .cloned()
-                .unwrap_or_default(),
+            path_ref_sketch: path_ref_sketch.clone(),
+            path_query_sketch: path_query_sketch.clone(),
             out_file: search_m
                 .get_one::<PathBuf>("out")
                 .cloned()
@@ -552,8 +533,16 @@ fn main() {
             if_ull: false,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
-            path_ref_ull: PathBuf::new(),
-            path_query_ull: PathBuf::new(),
+            path_ref_ull: if path_ref_sketch.as_os_str().is_empty() {
+                PathBuf::new()
+            } else {
+                ull_path_from_sketch_path(&path_ref_sketch)
+            },
+            path_query_ull: if path_query_sketch.as_os_str().is_empty() {
+                PathBuf::new()
+            } else {
+                ull_path_from_sketch_path(&path_query_sketch)
+            },
         };
 
         rayon::ThreadPoolBuilder::new()
