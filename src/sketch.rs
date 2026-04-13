@@ -56,8 +56,6 @@ pub fn sketch(params: SketchParams) {
                     ull_p: params.ull_p,
                     file_str: file.display().to_string(),
                     ull_state: ull.get_state().to_vec(),
-                    // not used anymore in dist; keep for compatibility
-                    ull_cardinality: 0.0,
                 })
             } else {
                 None
