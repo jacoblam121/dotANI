@@ -34,11 +34,7 @@ pub fn sketch(params: SketchParams) {
 
             let (kmer_hash_set, ull) = extract_kmer_hash_and_ull(&sketch, params.ull_p);
 
-            let hv = if is_x86_feature_detected!("avx2") {
-                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
-            } else {
-                hd::encode_hash_hd(&kmer_hash_set, &sketch)
-            };
+            let hv = hd::encode_hash_hd_auto(&kmer_hash_set, &sketch);
 
             sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
 
