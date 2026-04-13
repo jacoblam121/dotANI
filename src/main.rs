@@ -43,7 +43,7 @@ fn main() {
             Arg::new("out")
                 .short('o')
                 .long("out")
-                .help("Output sketch file")
+                .help("Output DotHash sketch file")
                 .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
@@ -169,7 +169,7 @@ fn main() {
             Arg::new("path_r")
                 .short('r')
                 .long("path-r")
-                .help("Path to reference sketch file")
+                .help("Path to reference DotHash sketch file")
                 .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
@@ -178,7 +178,23 @@ fn main() {
             Arg::new("path_q")
                 .short('q')
                 .long("path-q")
-                .help("Path to query sketch file")
+                .help("Path to query DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_r_ull")
+                .long("path-r-ull")
+                .help("Path to reference UltraLogLog sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_q_ull")
+                .long("path-q-ull")
+                .help("Path to query UltraLogLog sketch file")
                 .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
@@ -262,22 +278,6 @@ fn main() {
                 .help("Scaling factor for HV quantization")
                 .default_value("1.0")
                 .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("path_r_ull")
-                .long("path-r-ull")
-                .help("Path to reference UltraLogLog sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("path_q_ull")
-                .long("path-q-ull")
-                .help("Path to query UltraLogLog sketch file")
-                .required(true)
-                .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
         .arg(
@@ -549,6 +549,11 @@ fn main() {
             if_compressed: true,
             threads: *search_m.get_one::<u8>("thread").unwrap(),
             device: search_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: false,
+            ull_p: 0,
+            ull_out_file: PathBuf::new(),
+            path_ref_ull: PathBuf::new(),
+            path_query_ull: PathBuf::new(),
         };
 
         rayon::ThreadPoolBuilder::new()
