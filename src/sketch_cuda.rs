@@ -107,7 +107,13 @@ pub fn sketch_cuda(params: SketchParams) {
                 None
             };
 
-            let hv = hd::encode_hash_hd_auto(&kmer_hash_set, &sketch);
+            let hv = if is_x86_feature_detected!("avx512f") {
+                unsafe { hd::encode_hash_hd_avx512(&kmer_hash_set, &sketch) }
+            } else if is_x86_feature_detected!("avx2") {
+                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+            } else {
+                hd::encode_hash_hd(&kmer_hash_set, &sketch)
+            };
 
             sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
 
