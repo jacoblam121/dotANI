@@ -26,7 +26,9 @@ pub fn get_progress_bar(n_file: usize) -> ProgressBar {
     let pb = ProgressBar::new(n_file as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{wide_bar} {pos}/{len} ({percent}%) - Elapsed: {elapsed_precise}, ETA: {eta_precise}")
+            .template(
+                "{wide_bar} {pos}/{len} ({percent}%) - Elapsed: {elapsed_precise}, ETA: {eta_precise}",
+            )
             .unwrap(),
     );
 
@@ -123,11 +125,11 @@ pub fn dump_distribution_to_txt(path: &Path) {
 
     hd::decompress_file_sketch(&mut file_sketch);
 
-    let data: Vec<Vec<i16>> = (0..file_sketch.len())
+    let data: Vec<Vec<i32>> = (0..file_sketch.len())
         .map(|i| file_sketch[i].hv.clone())
         .collect();
 
-    let mut hist: HashMap<i16, u32> = HashMap::new();
+    let mut hist: HashMap<i32, u32> = HashMap::new();
     for row in &data {
         for v in row {
             if hist.get(v).is_none() {

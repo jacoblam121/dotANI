@@ -78,7 +78,6 @@ pub struct CliParams {
 
     pub threads: u8,
 
-    // ULL options
     pub if_ull: bool,
     pub ull_p: u32,
     pub ull_out_file: PathBuf,
@@ -99,7 +98,6 @@ pub struct SketchParams {
     pub hv_quant_scale: f32,
     pub if_compressed: bool,
 
-    // ULL options
     pub if_ull: bool,
     pub ull_p: u32,
     pub ull_out_file: PathBuf,
@@ -162,8 +160,8 @@ pub struct Sketch {
     pub hv_quant_scale: f32,
     pub hv_quant_bits: u8,
     pub hv_d: usize,
-    pub hv: Vec<i16>,
-    pub hv_l2_norm_sq: i32,
+    pub hv: Vec<i32>,
+    pub hv_l2_norm_sq: i64,
 }
 
 impl Default for Sketch {
@@ -249,9 +247,9 @@ pub struct FileSketch {
     pub seed: u64,
     pub hv_d: usize,
     pub hv_quant_bits: u8,
-    pub hv_norm_2: i32,
+    pub hv_norm_2: i64,
     pub file_str: String,
-    pub hv: Vec<i16>,
+    pub hv: Vec<i32>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]

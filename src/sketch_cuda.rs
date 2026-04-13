@@ -3,7 +3,6 @@ use crate::types::*;
 #[cfg(feature = "cuda-sketch")]
 use {
     crate::{dist, fastx_reader, hd, utils},
-    ultraloglog::UltraLogLog,
     cudarc::{
         driver::{CudaContext, LaunchConfig, PushKernelArg},
         nvrtc::Ptx,
@@ -14,10 +13,12 @@ use {
     std::collections::HashSet,
     std::path::{Path, PathBuf},
     std::sync::Arc,
+    ultraloglog::UltraLogLog,
 };
 
 #[cfg(feature = "cuda-sketch")]
-const CUDA_KERNEL_MY_STRUCT: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
+const CUDA_KERNEL_MY_STRUCT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
 
 #[cfg(feature = "cuda-sketch")]
 const SEQ_NT4_TABLE: [u8; 256] = [
@@ -36,7 +37,9 @@ const SEQ_NT4_TABLE: [u8; 256] = [
 pub fn sketch_cuda(params: SketchParams) {
     use log::error;
 
-    error!("Cuda sketching is not supported. Please add `--features cuda-sketch` for installation to enable it.");
+    error!(
+        "Cuda sketching is not supported. Please add `--features cuda-sketch` for installation to enable it."
+    );
 }
 
 // Sketch all FASTA files using GPU hashing, then CPU ULL + CPU HD encoding
@@ -66,12 +69,13 @@ pub fn sketch_cuda(params: SketchParams) {
                 hv_quant_bits: 16u8,
                 hv_norm_2: 0,
                 file_str: file.display().to_string(),
-                hv: Vec::<i16>::new(),
+                hv: Vec::<i32>::new(),
             };
 
-            // Full hash stream from GPU
+            // Get full hash stream from GPU.
             let full_hashes = extract_kmer_t1ha2_cuda_full_hashes(&sketch, &ctx, &module);
 
+            // Build sampled DotHash set on CPU.
             let threshold = u64::MAX / sketch.scaled;
             let mut sampled_hash_set = HashSet::<u64>::new();
 
@@ -168,7 +172,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     let stream = ctx.default_stream();
     let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
 
-    // Full hashes: enough slots for every k-mer a thread may emit
+    // Full hashes: one slot per possible k-mer handled by that thread.
     let n_hash_per_thread = kmer_per_thread;
     let n_hash_array = n_hash_per_thread * n_threads;
     let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
@@ -181,7 +185,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     builder.arg(&n_hash_per_thread);
     builder.arg(&ksize);
 
-    // Hard-coded full hash mode
+    // Full-hash mode.
     let full_threshold = u64::MAX;
     builder.arg(&full_threshold);
 
@@ -197,8 +201,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
 
     let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
 
-    // Zero is the empty sentinel in the output array.
-    // A real hash of 0 is astronomically rare, so dropping it is acceptable here.
+    // Zero is used as empty sentinel in the output buffer.
     host_kmer_hash.into_iter().filter(|&h| h != 0).collect()
 }
 
@@ -239,7 +242,6 @@ pub fn cuda_mmhash_bitpack_parallel(
             let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
             let gpu_seq_nt4_table = stream.clone_htod(&SEQ_NT4_TABLE).unwrap();
 
-            // Full hashes from GPU, then sample on CPU
             let n_hash_per_thread = bp_per_thread;
             let n_hash_array = n_hash_per_thread * n_threads;
             let mut gpu_kmer_bit_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
@@ -320,7 +322,6 @@ pub fn cuda_t1ha2_hash_parallel(
             let stream = ctx.default_stream();
             let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
 
-            // Full hashes from GPU, then sample on CPU
             let n_hash_per_thread = kmer_per_thread;
             let n_hash_array = n_hash_per_thread * n_threads;
             let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();

@@ -29,7 +29,7 @@ pub fn sketch(params: SketchParams) {
                 hv_quant_bits: 16u8,
                 hv_norm_2: 0,
                 file_str: file.display().to_string(),
-                hv: Vec::<i16>::new(),
+                hv: Vec::<i32>::new(),
             };
 
             let (kmer_hash_set, ull) = extract_kmer_hash_and_ull(&sketch, params.ull_p);
@@ -71,7 +71,6 @@ pub fn sketch(params: SketchParams) {
     pb.finish_and_clear();
 
     let all_filesketch: Vec<FileSketch> = results.iter().map(|(fs, _)| fs.clone()).collect();
-
     let all_ullsketch: Vec<FileUllSketch> = results.into_iter().filter_map(|(_, u)| u).collect();
 
     info!(
@@ -108,10 +107,10 @@ fn extract_kmer_hash_and_ull(sketch: &FileSketch, ull_p: u32) -> (HashSet<u64>, 
         for (_, kmer, _) in norm_seq.canonical_kmers(ksize, &rc) {
             let h = t1ha::t1ha2_atonce(kmer, seed);
 
-            // ULL tracks the full original hashed k-mer stream
+            // ULL tracks the full hashed k-mer stream
             ull.add(h);
 
-            // HD sketch uses the FracMinHash-thresholded sample
+            // HD sketch uses the thresholded sample
             if h < threshold {
                 hash_set.insert(h);
             }

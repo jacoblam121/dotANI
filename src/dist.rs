@@ -13,7 +13,6 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
-    // Load ULL sketches
     let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path());
     let query_ull_sketch = if if_sym {
         ref_ull_sketch.clone()
@@ -21,7 +20,6 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())
     };
 
-    // Load HD sketches
     let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path());
     let mut query_file_sketch = if if_sym {
         ref_file_sketch.clone()
@@ -29,7 +27,6 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         utils::load_sketch(sketch_dist.path_query_sketch.as_path())
     };
 
-    // Sanity checks
     assert_eq!(
         ref_file_sketch.len(),
         ref_ull_sketch.len(),
@@ -70,11 +67,9 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         "Ref and query sketches use different HV dimensions!"
     );
 
-    // Decompress HD sketches
     hd::decompress_file_sketch(&mut ref_file_sketch);
     hd::decompress_file_sketch(&mut query_file_sketch);
 
-    // Compute ANI
     compute_hv_ani(
         sketch_dist,
         &ref_file_sketch,
@@ -85,7 +80,6 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         if_sym,
     );
 
-    // Dump results
     utils::dump_ani_file(sketch_dist);
 
     info!(
@@ -96,21 +90,13 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     );
 }
 
-// Kept for compatibility
-pub fn compute_hv_l2_norm(hv: &Vec<i16>) -> i32 {
-    let sum_i64: i64 = hv
-        .iter()
+pub fn compute_hv_l2_norm(hv: &Vec<i32>) -> i64 {
+    hv.iter()
         .map(|&num| {
             let x = num as i64;
             x * x
         })
-        .sum();
-
-    if sum_i64 > i32::MAX as i64 {
-        i32::MAX
-    } else {
-        sum_i64 as i32
-    }
+        .sum()
 }
 
 #[inline]
@@ -120,7 +106,7 @@ pub fn ull_cardinality_from_state(state: &[u8]) -> f64 {
 }
 
 #[inline]
-pub fn compute_pairwise_dot(r: &[i16], q: &[i16]) -> i64 {
+pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
     r.iter()
         .zip(q.iter())
         .map(|(x, y)| (*x as i64) * (*y as i64))
@@ -128,15 +114,17 @@ pub fn compute_pairwise_dot(r: &[i16], q: &[i16]) -> i64 {
 }
 
 pub fn compute_pairwise_ani_with_ull(
-    r: &[i16],
-    q: &[i16],
+    r: &[i32],
+    q: &[i32],
     card_r: f64,
     card_q: f64,
     hv_d: usize,
     ksize: u8,
 ) -> f32 {
     let dot = compute_pairwise_dot(r, q) as f64;
-    let inter_hat = dot / (hv_d as f64);
+
+    // DotHash intersection estimate
+    let inter_hat = dot / hv_d as f64;
 
     if inter_hat <= 0.0 {
         return 0.0;
@@ -183,7 +171,6 @@ pub fn compute_hv_ani(
 
     let pb = utils::get_progress_bar(num_dists);
 
-    // Compute ULL cardinalities once per genome
     let ref_cards: Vec<f64> = ref_ull_sketch
         .par_iter()
         .map(|s| ull_cardinality_from_state(&s.ull_state))
@@ -222,7 +209,7 @@ pub fn compute_hv_ani(
             let card_q = query_cards[ind.1];
 
             let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
-            let inter_hat = dot / (r.hv_d as f64);
+            let inter_hat = dot / r.hv_d as f64;
             let union_hat = card_r + card_q - inter_hat;
             let jaccard = if union_hat > 0.0 {
                 inter_hat / union_hat
@@ -255,10 +242,7 @@ pub fn compute_hv_ani(
                 );
             }
 
-            *file_ani_pair = (
-                (r.file_str.clone(), q.file_str.clone()),
-                ani,
-            );
+            *file_ani_pair = ((r.file_str.clone(), q.file_str.clone()), ani);
 
             pb.inc(1);
             pb.eta();
