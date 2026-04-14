@@ -28,6 +28,13 @@ fn ull_path_from_sketch_path(p: &PathBuf) -> PathBuf {
     PathBuf::from(format!("{}.ull", p.to_string_lossy()))
 }
 
+fn default_threads_u8() -> u8 {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(u8::MAX as usize) as u8
+}
+
 fn main() {
     init_log();
 
@@ -57,7 +64,8 @@ fn main() {
                 .long("threads")
                 .short('T')
                 .help("Number of threads, default all logical cores")
-                .value_parser(clap::value_parser!(usize)),
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
         )
         .arg(
             Arg::new("sketch_method")
@@ -182,7 +190,8 @@ fn main() {
                 .long("threads")
                 .short('T')
                 .help("Number of threads, default all logical cores")
-                .value_parser(clap::value_parser!(usize)),
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
         )
         .arg(
             Arg::new("ani_th")
@@ -233,7 +242,8 @@ fn main() {
                 .long("threads")
                 .short('T')
                 .help("Number of threads, default all logical cores")
-                .value_parser(clap::value_parser!(usize)),
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
         )
         .arg(
             Arg::new("ani_th")
@@ -257,6 +267,11 @@ fn main() {
 
     if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
         let out_file = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
+        let threads = sketch_m
+            .get_one::<usize>("threads")
+            .copied()
+            .unwrap_or_else(|| default_threads_u8() as usize)
+            .min(u8::MAX as usize) as u8;
 
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
@@ -276,10 +291,7 @@ fn main() {
             hv_quant_scale: *sketch_m.get_one::<f32>("quant_scale").unwrap(),
             ani_threshold: *sketch_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            let threads = *sketch_m
-                .get_one::<usize>("threads")
-                .copied()
-                .unwrap_or_else(|| num_cpus::get());
+            threads,
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
             if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -303,6 +315,11 @@ fn main() {
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
         let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
         let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
+        let threads = dist_m
+            .get_one::<usize>("threads")
+            .copied()
+            .unwrap_or_else(|| default_threads_u8() as usize)
+            .min(u8::MAX as usize) as u8;
 
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
@@ -310,24 +327,17 @@ fn main() {
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
             out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
-
-            // not needed for dist; loaded from sketch files
             ksize: 0,
             sketch_method: String::new(),
             canonical: true,
             seed: 0,
-            scaled: 1,
+            scaled: 1u64,
             hv_d: 0,
             hv_quant_scale: 1.0,
-
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            let threads = *dist_m
-                .get_one::<usize>("threads")
-                .copied()
-                .unwrap_or_else(|| num_cpus::get());
+            threads,
             device: String::from("cpu"),
-
             if_ull: true,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
@@ -351,6 +361,11 @@ fn main() {
             .get_one::<PathBuf>("path_q")
             .cloned()
             .unwrap_or_default();
+        let threads = search_m
+            .get_one::<usize>("threads")
+            .copied()
+            .unwrap_or_else(|| default_threads_u8() as usize)
+            .min(u8::MAX as usize) as u8;
 
         let cli_params = types::CliParams {
             mode: params::CMD_SEARCH.to_string(),
@@ -364,21 +379,17 @@ fn main() {
                 .get_one::<PathBuf>("out")
                 .cloned()
                 .unwrap_or_default(),
-
-            // not needed for search either; should come from sketch files/db
             ksize: 0,
             sketch_method: String::new(),
             canonical: true,
             seed: 0,
-            scaled: 1,
+            scaled: 1u64,
             hv_d: 0,
             hv_quant_scale: 1.0,
-
             ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            threads: *search_m.get_one::<usize>("threads").unwrap_or_else(|| &num_cpus::get()),
+            threads,
             device: String::from("cpu"),
-
             if_ull: false,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
@@ -399,7 +410,6 @@ fn main() {
             .build_global()
             .unwrap();
 
-        // TODO: support search
         let _ = cli_params;
     } else {
         unreachable!("clap should ensure we don't get here");
