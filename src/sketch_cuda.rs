@@ -42,7 +42,6 @@ pub fn sketch_cuda(params: SketchParams) {
     );
 }
 
-// Sketch all FASTA files using GPU hashing, then CPU ULL + CPU HD encoding
 #[cfg(all(target_arch = "x86_64", feature = "cuda"))]
 pub fn sketch_cuda(params: SketchParams) {
     let files = utils::get_fasta_files(&params.path);
@@ -72,10 +71,8 @@ pub fn sketch_cuda(params: SketchParams) {
                 hv: Vec::<i32>::new(),
             };
 
-            // Get full hash stream from GPU.
             let full_hashes = extract_kmer_t1ha2_cuda_full_hashes(&sketch, &ctx, &module);
 
-            // Build sampled DotHash set on CPU.
             let threshold = u64::MAX / sketch.scaled;
             let mut sampled_hash_set = HashSet::<u64>::new();
 
@@ -108,11 +105,11 @@ pub fn sketch_cuda(params: SketchParams) {
             };
 
             let hv = if is_x86_feature_detected!("avx512f") {
-                unsafe { hd::encode_hash_hd_avx512(&kmer_hash_set, &sketch) }
+                unsafe { hd::encode_hash_hd_avx512(&sampled_hash_set, &sketch) }
             } else if is_x86_feature_detected!("avx2") {
-                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+                unsafe { hd::encode_hash_hd_avx2(&sampled_hash_set, &sketch) }
             } else {
-                hd::encode_hash_hd(&kmer_hash_set, &sketch)
+                hd::encode_hash_hd(&sampled_hash_set, &sketch)
             };
 
             sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
@@ -174,7 +171,6 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     let stream = ctx.default_stream();
     let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
 
-    // Full hashes: one slot per possible k-mer handled by that thread.
     let n_hash_per_thread = kmer_per_thread;
     let n_hash_array = n_hash_per_thread * n_threads;
     let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
@@ -187,7 +183,6 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     builder.arg(&n_hash_per_thread);
     builder.arg(&ksize);
 
-    // Full-hash mode.
     let full_threshold = u64::MAX;
     builder.arg(&full_threshold);
 
@@ -202,8 +197,6 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     }
 
     let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
-
-    // Zero is used as empty sentinel in the output buffer.
     host_kmer_hash.into_iter().filter(|&h| h != 0).collect()
 }
 
