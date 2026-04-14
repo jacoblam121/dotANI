@@ -38,8 +38,7 @@ fn default_threads_u8() -> u8 {
 fn main() {
     init_log();
     println!("\n ************** initializing logger *****************\n");
-    env_logger::Builder::from_default_env().init();
-    log::info!("Logger initialized from default environment");
+    log::info!("Logger initialized");
 
     let sketch_cmd = Command::new(params::CMD_SKETCH)
         .version("0.2.1")
