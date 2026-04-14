@@ -204,28 +204,22 @@ fn main() {
         );
 
     let search_cmd = Command::new(params::CMD_SEARCH)
-        .about("Search a query sketch against a sketch database")
+        .about("Search query sketches against a reference sketch database")
         .arg(
-            Arg::new("path")
-                .short('p')
-                .long("path")
-                .help("Path to sketch file or sketch database")
+            Arg::new("db")
+                .short('d')
+                .long("db")
+                .help("Path to reference sketch database")
+                .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("path_r")
-                .short('r')
-                .long("path-r")
-                .help("Path to reference sketch file")
-                .value_parser(value_parser!(PathBuf))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("path_q")
+            Arg::new("query")
                 .short('q')
-                .long("path-q")
+                .long("query")
                 .help("Path to query sketch file")
+                .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
@@ -234,6 +228,7 @@ fn main() {
                 .short('o')
                 .long("out")
                 .help("Output search results file")
+                .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
@@ -353,14 +348,8 @@ fn main() {
         let mut sketch_dist = types::SketchDist::new(&cli_params);
         dist::dist(&mut sketch_dist);
     } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
-        let path_ref_sketch = search_m
-            .get_one::<PathBuf>("path_r")
-            .cloned()
-            .unwrap_or_default();
-        let path_query_sketch = search_m
-            .get_one::<PathBuf>("path_q")
-            .cloned()
-            .unwrap_or_default();
+        let path_ref_sketch = search_m.get_one::<PathBuf>("db").cloned().unwrap();
+        let path_query_sketch = search_m.get_one::<PathBuf>("query").cloned().unwrap();
         let threads = search_m
             .get_one::<usize>("threads")
             .copied()
@@ -369,16 +358,10 @@ fn main() {
 
         let cli_params = types::CliParams {
             mode: params::CMD_SEARCH.to_string(),
-            path: search_m
-                .get_one::<PathBuf>("path")
-                .cloned()
-                .unwrap_or_default(),
+            path: PathBuf::new(),
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
-            out_file: search_m
-                .get_one::<PathBuf>("out")
-                .cloned()
-                .unwrap_or_default(),
+            out_file: search_m.get_one::<PathBuf>("out").cloned().unwrap(),
             ksize: 0,
             sketch_method: String::new(),
             canonical: true,
@@ -393,16 +376,8 @@ fn main() {
             if_ull: false,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
-            path_ref_ull: if path_ref_sketch.as_os_str().is_empty() {
-                PathBuf::new()
-            } else {
-                ull_path_from_sketch_path(&path_ref_sketch)
-            },
-            path_query_ull: if path_query_sketch.as_os_str().is_empty() {
-                PathBuf::new()
-            } else {
-                ull_path_from_sketch_path(&path_query_sketch)
-            },
+            path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
+            path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
         };
 
         rayon::ThreadPoolBuilder::new()
