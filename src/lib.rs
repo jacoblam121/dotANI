@@ -7,6 +7,9 @@ pub mod sketch_cuda;
 pub mod types;
 pub mod utils;
 
+#[cfg(feature = "cuda")]
+pub mod cuda_dot;
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;

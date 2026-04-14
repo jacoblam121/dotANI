@@ -4,7 +4,7 @@ use bindgen::CargoCallbacks;
 use regex::Regex;
 
 fn main() {
-    if cfg!(feature = "cuda-sketch") {
+    if cfg!(feature = "cuda") {
         println!("cargo:rerun-if-changed=cuda");
         println!("cargo:rerun-if-changed=src/cuda_kernel.cu");
         println!("cargo:rerun-if-changed=src/cuda_kernel.h");

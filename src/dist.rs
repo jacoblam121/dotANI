@@ -4,13 +4,16 @@ use crate::hd;
 use crate::types::*;
 use crate::utils;
 
-use log::info;
+use log::{info, warn};
 use rayon::prelude::*;
 
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(feature = "cuda")]
+use crate::cuda_dot;
 
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
@@ -133,10 +136,8 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
         let vr = _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i);
         let vq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
 
-        // Even lanes: indices 0,2,4,6 -> 64-bit products
         let prod_even = _mm256_mul_epi32(vr, vq);
 
-        // Odd lanes: shift each 64-bit lane right by 32 so odd i32 becomes even-positioned
         let vr_shift = _mm256_srli_epi64(vr, 32);
         let vq_shift = _mm256_srli_epi64(vq, 32);
         let prod_odd = _mm256_mul_epi32(vr_shift, vq_shift);
@@ -175,10 +176,8 @@ pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
         let vr = _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i);
         let vq = _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i);
 
-        // Even lanes: 0,2,4,...,14 -> 8 x i64 products
         let prod_even = _mm512_mul_epi32(vr, vq);
 
-        // Odd lanes: shift within each 64-bit lane so odd i32 becomes even-positioned
         let vr_shift = _mm512_srli_epi64(vr, 32);
         let vq_shift = _mm512_srli_epi64(vq, 32);
         let prod_odd = _mm512_mul_epi32(vr_shift, vq_shift);
@@ -273,6 +272,20 @@ pub unsafe fn compute_pairwise_ani_with_ull_avx512(
     ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
 
+#[cfg(feature = "cuda")]
+fn flatten_hv_matrix(filesketch: &[FileSketch]) -> Vec<i32> {
+    if filesketch.is_empty() {
+        return Vec::new();
+    }
+
+    let hv_d = filesketch[0].hv_d;
+    let mut out = Vec::with_capacity(filesketch.len() * hv_d);
+    for fs in filesketch {
+        out.extend_from_slice(&fs.hv);
+    }
+    out
+}
+
 pub fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
     ref_filesketch: &[FileSketch],
@@ -319,6 +332,85 @@ pub fn compute_hv_ani(
     }
 
     sketch_dist.file_ani = vec![(("".to_string(), "".to_string()), 0.0); num_dists];
+
+    #[cfg(feature = "cuda")]
+    {
+        let hv_d = ref_filesketch[0].hv_d;
+        let query_flat = flatten_hv_matrix(query_filesketch);
+        let ref_flat = flatten_hv_matrix(ref_filesketch);
+        let mut dot_matrix = vec![0i64; num_query_files * num_ref_files];
+
+        match cuda_dot::pairwise_dot_rect_multi_gpu_i32(
+            &query_flat,
+            num_query_files,
+            &ref_flat,
+            num_ref_files,
+            hv_d,
+            &mut dot_matrix,
+            256,
+            256,
+        ) {
+            Ok(()) => {
+                info!("GPU dot-product completed successfully");
+
+                sketch_dist
+                    .file_ani
+                    .par_iter_mut()
+                    .enumerate()
+                    .zip(index_dist.into_par_iter())
+                    .for_each(|((pair_idx, file_ani_pair), (i, j))| {
+                        let dot = dot_matrix[j * num_ref_files + i] as f64;
+                        let inter_hat = dot / hv_d as f64;
+                        let ani = ani_from_intersection_and_cardinalities(
+                            inter_hat,
+                            ref_cards[i],
+                            query_cards[j],
+                            ksize,
+                        );
+
+                        if pair_idx < 8 {
+                            let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
+                            let jaccard = if union_hat > 0.0 {
+                                inter_hat / union_hat
+                            } else {
+                                -1.0
+                            };
+
+                            info!(
+                                "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
+                                pair_idx,
+                                ref_filesketch[i].file_str,
+                                query_filesketch[j].file_str,
+                                ref_cards[i],
+                                query_cards[j],
+                                dot,
+                                inter_hat,
+                                union_hat,
+                                jaccard,
+                                ani
+                            );
+                        }
+
+                        *file_ani_pair = (
+                            (
+                                ref_filesketch[i].file_str.clone(),
+                                query_filesketch[j].file_str.clone(),
+                            ),
+                            ani,
+                        );
+
+                        pb.inc(1);
+                        pb.eta();
+                    });
+
+                pb.finish_and_clear();
+                return;
+            }
+            Err(e) => {
+                warn!("GPU dot-product failed, falling back to CPU: {e:?}");
+            }
+        }
+    }
 
     sketch_dist
         .file_ani
