@@ -17,7 +17,7 @@ use std::arch::x86_64::*;
 /// Math:
 /// - hv starts at -N for every coordinate
 /// - each seed contributes +2 when the corresponding random bit is 1
-/// So final coordinate = (#ones * 2) - N, exactly matching the original code.
+/// So final coordinate = (#ones * 2) - N.
 pub fn encode_hash_hd(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i32> {
     let hv_d = sketch.hv_d;
     let seed_vec = Vec::from_iter(kmer_hash_set.clone());
@@ -54,7 +54,7 @@ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSke
 
     seed_vec.resize(num_seed_round_4, 0);
 
-    let mut rng_vec = vec![WyRng::default(); 4];
+    let mut rng_vec = [WyRng::default(), WyRng::default(), WyRng::default(), WyRng::default()];
     let mut rnd_vec = [0u64; 4];
 
     for b_i in 0..num_batch_round_4 {
@@ -83,12 +83,11 @@ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSke
             let base = chunk_i * 64;
 
             for bit in 0..64 {
-                let vshift = _mm256_set1_epi64x((63 - bit) as i64);
-                let shifted = _mm256_sllv_epi64(vrnd, vshift);
-
-                let mask = _mm256_movemask_pd(_mm256_castsi256_pd(shifted)) as u32;
-                let ones = mask.count_ones() as i32;
-
+                let mask64 = 1u64 << bit;
+                let vmask = _mm256_set1_epi64x(mask64 as i64);
+                let m = _mm256_cmpeq_epi64(_mm256_and_si256(vrnd, vmask), vmask);
+                let lane_mask = _mm256_movemask_pd(_mm256_castsi256_pd(m)) as u32;
+                let ones = lane_mask.count_ones() as i32;
                 hv[base + bit] += ones << 1;
             }
         }
@@ -108,34 +107,37 @@ pub unsafe fn encode_hash_hd_avx512(
 
     let mut hv = vec![-(num_seed as i32); hv_d];
 
+    // Batch 16 seeds at once using two zmm registers.
     let mut seed_vec = Vec::from_iter(kmer_hash_set.clone());
-    let num_tail = num_seed % 8;
-    let num_seed_round_8 = num_seed + if num_tail == 0 { 0 } else { 8 - num_tail };
-    let num_batch_round_8 = num_seed_round_8 / 8;
+    let num_tail = num_seed % 16;
+    let num_seed_round_16 = num_seed + if num_tail == 0 { 0 } else { 16 - num_tail };
+    let num_batch_round_16 = num_seed_round_16 / 16;
     let num_chunk = hv_d / 64;
 
-    seed_vec.resize(num_seed_round_8, 0);
+    seed_vec.resize(num_seed_round_16, 0);
 
-    let mut rng_vec = vec![WyRng::default(); 8];
-    let mut rnd_vec = [0u64; 8];
+    let mut rng_vec = std::array::from_fn::<WyRng, 16, _>(|_| WyRng::default());
+    let mut rnd_vec = [0u64; 16];
 
-    for b_i in 0..num_batch_round_8 {
-        for lane in 0..8 {
-            rng_vec[lane] = WyRng::seed_from_u64(seed_vec[b_i * 8 + lane]);
+    for b_i in 0..num_batch_round_16 {
+        let batch_base = b_i * 16;
+
+        for lane in 0..16 {
+            rng_vec[lane] = WyRng::seed_from_u64(seed_vec[batch_base + lane]);
         }
 
         for chunk_i in 0..num_chunk {
-            for lane in 0..8 {
+            for lane in 0..16 {
                 rnd_vec[lane] = rng_vec[lane].next_u64();
             }
 
-            if b_i == num_batch_round_8 - 1 && num_tail > 0 {
-                for lane in num_tail..8 {
+            if b_i == num_batch_round_16 - 1 && num_tail > 0 {
+                for lane in num_tail..16 {
                     rnd_vec[lane] = 0;
                 }
             }
 
-            let vrnd = _mm512_set_epi64(
+            let vrnd0 = _mm512_set_epi64(
                 rnd_vec[7] as i64,
                 rnd_vec[6] as i64,
                 rnd_vec[5] as i64,
@@ -146,15 +148,28 @@ pub unsafe fn encode_hash_hd_avx512(
                 rnd_vec[0] as i64,
             );
 
+            let vrnd1 = _mm512_set_epi64(
+                rnd_vec[15] as i64,
+                rnd_vec[14] as i64,
+                rnd_vec[13] as i64,
+                rnd_vec[12] as i64,
+                rnd_vec[11] as i64,
+                rnd_vec[10] as i64,
+                rnd_vec[9] as i64,
+                rnd_vec[8] as i64,
+            );
+
             let base = chunk_i * 64;
 
+            // Still one update per bit position, but now over 16 seeds per pass.
             for bit in 0..64 {
-                let vshift = _mm512_set1_epi64((63 - bit) as i64);
-                let shifted = _mm512_sllv_epi64(vrnd, vshift);
+                let mask64 = 1u64 << bit;
+                let vmask = _mm512_set1_epi64(mask64 as i64);
 
-                let mask = _mm512_movepi64_mask(shifted) as u32;
-                let ones = mask.count_ones() as i32;
+                let m0 = _mm512_cmpeq_epi64_mask(_mm512_and_si512(vrnd0, vmask), vmask);
+                let m1 = _mm512_cmpeq_epi64_mask(_mm512_and_si512(vrnd1, vmask), vmask);
 
+                let ones = (m0.count_ones() + m1.count_ones()) as i32;
                 hv[base + bit] += ones << 1;
             }
         }
@@ -207,7 +222,7 @@ pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i32>) -> u8 {
             .clone_from(&hv_compress_bits[..].align_to::<i32>().1.to_vec());
     } else {
         let total_bits = quant_bit as usize * hv_d;
-        let len_bit_vec_u32 = (total_bits + 31) / 32;
+        let len_bit_vec_u32 = total_bits.div_ceil(32);
         let mut hv_compress_bits: Vec<i32> = vec![0; len_bit_vec_u32];
 
         let offset: i64 = 1i64 << (quant_bit - 1);
@@ -230,7 +245,7 @@ pub fn decompress_file_sketch(file_sketch: &mut Vec<FileSketch>) {
     let hv_dim = file_sketch[0].hv_d;
     info!("Decompressing sketch with HV dim={}", hv_dim);
 
-    file_sketch.into_par_iter().for_each(|sketch| {
+    file_sketch.par_iter_mut().for_each(|sketch| {
         let hv_decompressed = unsafe { decompress_hd_sketch(sketch) };
         sketch.hv.clone_from(&hv_decompressed);
     });
