@@ -10,7 +10,14 @@ use crate::{hd, types::*};
 
 pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
     let mut all_files = Vec::new();
-    for t in ["*.fna", "*.fa", "*.fasta"] {
+    for t in [
+        "*.fna",
+        "*.fa",
+        "*.fasta",
+        "*.fna.gz",
+        "*.fa.gz",
+        "*.fasta.gz",
+    ] {
         let mut files: Vec<_> = glob(path.join(t).to_str().unwrap())
             .expect("Failed to read glob pattern")
             .map(|f| f.unwrap())
@@ -19,6 +26,8 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
         all_files.append(&mut files);
     }
 
+    all_files.sort();
+    all_files.dedup();
     all_files
 }
 
