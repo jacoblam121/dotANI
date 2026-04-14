@@ -39,8 +39,8 @@ void dot_rect_i32_i64_tiled(
     const int rj = j0 + local_j;
 
     extern __shared__ int smem[];
-    int* As = smem;                                      // BLOCK_M * BLOCK_K
-    int* Bs = As + (BLOCK_M * BLOCK_K);                  // BLOCK_N * BLOCK_K
+    int* As = smem;                     // BLOCK_M * BLOCK_K
+    int* Bs = As + (BLOCK_M * BLOCK_K); // BLOCK_N * BLOCK_K
 
     long long acc = 0;
 
@@ -70,10 +70,10 @@ void dot_rect_i32_i64_tiled(
             const int col = idx / bk;
             const int kk  = idx - col * bk;
 
-            const int ഗ്രj = j0 + (int)blockIdx.x * (int)blockDim.x + col;
+            const int grj = j0 + (int)blockIdx.x * (int)blockDim.x + col;
             int v = 0;
-            if (ഗ്രj < nr) {
-                v = ref_hv[(size_t)ഗ്രj * (size_t)d + (size_t)(k0 + kk)];
+            if (grj < nr) {
+                v = ref_hv[(size_t)grj * (size_t)d + (size_t)(k0 + kk)];
             }
             Bs[col * BLOCK_K + kk] = v;
         }
