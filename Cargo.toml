@@ -1,6 +1,6 @@
 [package]
 name = "dotani"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/jianshu93/dotANI.git"
 
@@ -23,6 +23,8 @@ indicatif = "0.17.7"
 clap = { version = "4.4.6", features = ["cargo"] }
 serde = { version = "1.0.193", features = ["derive"] }
 anyhow = "1"
+zstd = { version = "0.13", features = ["zstdmt"] }
+env_logger = "0.11"
 cudarc = { version = "0.19.4", features = [
     "driver",
     "nvrtc",

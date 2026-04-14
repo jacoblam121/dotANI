@@ -4,21 +4,32 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::{hd, types::*};
 
 pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
     let mut all_files = Vec::new();
-    for t in [
+
+    for pattern in [
         "*.fna",
         "*.fa",
         "*.fasta",
         "*.fna.gz",
         "*.fa.gz",
         "*.fasta.gz",
+        "*.fna.bz2",
+        "*.fa.bz2",
+        "*.fasta.bz2",
+        "*.fna.xz",
+        "*.fa.xz",
+        "*.fasta.xz",
+        "*.fna.zst",
+        "*.fa.zst",
+        "*.fasta.zst",
     ] {
-        let mut files: Vec<_> = glob(path.join(t).to_str().unwrap())
+        let mut files: Vec<_> = glob(path.join(pattern).to_str().unwrap())
             .expect("Failed to read glob pattern")
             .map(|f| f.unwrap())
             .collect();
@@ -67,19 +78,75 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
     let out_filename = out_file_path.to_str().unwrap();
 
     let serialized = bincode::serialize::<Vec<FileUllSketch>>(file_ull_sketch).unwrap();
-    fs::write(out_filename, &serialized).expect("Dump ULL sketch file failed!");
 
-    let sketch_size_mb = serialized.len() as f32 / 1024.0 / 1024.0;
+    let n_threads = if serialized.len() < 8 * 1024 * 1024 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(32)
+    };
+
+    let mut encoder =
+        zstd::stream::Encoder::new(Vec::new(), 3).expect("Failed to create zstd encoder");
+
+    if n_threads > 1 {
+        encoder
+            .multithread(n_threads as u32)
+            .expect("Failed to enable zstd multithreading");
+    }
+
+    encoder
+        .write_all(serialized.as_slice())
+        .expect("Failed to write ULL bytes into zstd encoder");
+
+    let compressed = encoder.finish().expect("Failed to finalize zstd encoding");
+
+    fs::write(out_filename, &compressed).expect("Dump ULL sketch file failed!");
+
+    let raw_size_mb = serialized.len() as f32 / 1024.0 / 1024.0;
+    let compressed_size_mb = compressed.len() as f32 / 1024.0 / 1024.0;
+    let ratio = if serialized.is_empty() {
+        1.0
+    } else {
+        compressed.len() as f32 / serialized.len() as f32
+    };
+
     info!(
-        "Dump ULL sketch file to {} with size {:.2} MB",
-        out_filename, sketch_size_mb
+        "Dump compressed ULL sketch file to {} with compressed size {:.2} MB (raw {:.2} MB, ratio {:.3}, zstd threads {})",
+        out_filename,
+        compressed_size_mb,
+        raw_size_mb,
+        ratio,
+        n_threads
     );
 }
 
 pub fn load_ull_sketch(path: &Path) -> Vec<FileUllSketch> {
     info!("Loading ULL sketch from {}", path.to_str().unwrap());
-    let serialized = fs::read(path).expect("Opening ULL sketch file failed!");
-    bincode::deserialize::<Vec<FileUllSketch>>(&serialized[..]).unwrap()
+    let bytes = fs::read(path).expect("Opening ULL sketch file failed!");
+
+    // New format: zstd-compressed bincode
+    if let Ok(serialized) = zstd::stream::decode_all(bytes.as_slice()) {
+        if let Ok(v) = bincode::deserialize::<Vec<FileUllSketch>>(&serialized[..]) {
+            return v;
+        }
+    }
+
+    // Backward compatibility: old raw bincode format
+    if let Ok(v) = bincode::deserialize::<Vec<FileUllSketch>>(&bytes[..]) {
+        warn!(
+            "ULL sketch file {} is in legacy uncompressed format",
+            path.to_string_lossy()
+        );
+        return v;
+    }
+
+    panic!(
+        "Failed to load ULL sketch file {} as either zstd-compressed or legacy uncompressed format",
+        path.to_string_lossy()
+    );
 }
 
 pub fn dump_ani_file(sketch_dist: &SketchDist) {
