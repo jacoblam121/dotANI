@@ -111,11 +111,9 @@ fn extract_kmer_hash_and_ull(sketch: &FileSketch, ull_p: u32) -> (HashSet<u64>, 
 
             // ULL tracks the full hashed k-mer stream
             ull.add(h);
+            // dothash tracks all hashed kmers
+            hash_set.insert(h);
 
-            // HD sketch uses the thresholded sample
-            if h < threshold {
-                hash_set.insert(h);
-            }
         }
     }
 

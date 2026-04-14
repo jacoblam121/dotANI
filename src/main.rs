@@ -53,13 +53,11 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("thread")
-                .short('t')
-                .long("thread")
-                .help("Number of threads used for computation")
-                .default_value("16")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
+            Arg::new("threads")
+                .long("threads")
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("sketch_method")
@@ -94,15 +92,6 @@ fn main() {
                 .long("seed")
                 .help("Hash seed")
                 .default_value("123")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("scaled")
-                .short('s')
-                .long("scaled")
-                .help("Scaled factor for FracMinHash")
-                .default_value("1")
                 .value_parser(value_parser!(u64))
                 .action(ArgAction::Set),
         )
@@ -189,13 +178,11 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("thread")
-                .short('t')
-                .long("thread")
-                .help("Number of threads used for computation")
-                .default_value("16")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
+            Arg::new("threads")
+                .long("threads")
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("ani_th")
@@ -242,13 +229,11 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("thread")
-                .short('t')
-                .long("thread")
-                .help("Number of threads used for computation")
-                .default_value("16")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
+            Arg::new("threads")
+                .long("threads")
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("ani_th")
@@ -286,12 +271,15 @@ fn main() {
                 .unwrap(),
             canonical: *sketch_m.get_one::<bool>("canonical").unwrap(),
             seed: *sketch_m.get_one::<u64>("seed").unwrap(),
-            scaled: *sketch_m.get_one::<u64>("scaled").unwrap(),
+            scaled: 1u64,
             hv_d: *sketch_m.get_one::<usize>("hv_d").unwrap(),
             hv_quant_scale: *sketch_m.get_one::<f32>("quant_scale").unwrap(),
             ani_threshold: *sketch_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            threads: *sketch_m.get_one::<u8>("thread").unwrap(),
+            let threads = *sketch_m
+                .get_one::<usize>("threads")
+                .copied()
+                .unwrap_or_else(|| num_cpus::get());
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
             if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -334,7 +322,10 @@ fn main() {
 
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            threads: *dist_m.get_one::<u8>("thread").unwrap(),
+            let threads = *dist_m
+                .get_one::<usize>("threads")
+                .copied()
+                .unwrap_or_else(|| num_cpus::get());
             device: String::from("cpu"),
 
             if_ull: true,
@@ -385,7 +376,7 @@ fn main() {
 
             ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
-            threads: *search_m.get_one::<u8>("thread").unwrap(),
+            threads: *search_m.get_one::<usize>("threads").unwrap_or_else(|| &num_cpus::get()),
             device: String::from("cpu"),
 
             if_ull: false,

@@ -82,9 +82,7 @@ pub fn sketch_cuda(params: SketchParams) {
 
                 for &h in &full_hashes {
                     ull.add(h);
-                    if h < threshold {
-                        sampled_hash_set.insert(h);
-                    }
+                    sampled_hash_set.insert(h);
                 }
 
                 Some(FileUllSketch {
