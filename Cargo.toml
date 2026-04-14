@@ -24,7 +24,6 @@ clap = { version = "4.4.6", features = ["cargo"] }
 serde = { version = "1.0.193", features = ["derive"] }
 anyhow = "1"
 zstd = { version = "0.13", features = ["zstdmt"] }
-env_logger = "0.11"
 cudarc = { version = "0.19.4", features = [
     "driver",
     "nvrtc",
