@@ -106,14 +106,6 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("ull")
-                .long("ull")
-                .help("Whether to generate UltraLogLog sketches")
-                .default_value("true")
-                .value_parser(value_parser!(bool))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("ull_p")
                 .long("ull-p")
                 .help("UltraLogLog precision parameter")
@@ -290,7 +282,7 @@ fn main() {
             if_compressed: true,
             threads,
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
-            if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
+            if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
             ull_out_file: ull_path_from_sketch_path(&out_file),
             path_ref_ull: PathBuf::new(),
@@ -375,7 +367,7 @@ fn main() {
             if_compressed: true,
             threads,
             device: String::from("cpu"),
-            if_ull: false,
+            if_ull: true,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
