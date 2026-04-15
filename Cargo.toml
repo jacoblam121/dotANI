@@ -4,8 +4,6 @@ version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/jianshu93/dotANI.git"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [build-dependencies]
 bindgen = "0.66.1"
 cc = "1.0.82"
