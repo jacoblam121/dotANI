@@ -123,15 +123,6 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("ani_th")
-                .short('a')
-                .long("ani-th")
-                .help("ANI threshold")
-                .default_value("85.0")
-                .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("device")
                 .short('D')
                 .long("device")
