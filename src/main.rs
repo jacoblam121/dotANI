@@ -47,7 +47,7 @@ fn main() {
             Arg::new("path")
                 .short('p')
                 .long("path")
-                .help("Input folder path containing .fna/.fa/.fasta files")
+                .help("Input folder path containing .fna/.fa/.fasta files (gzip/bzip2/xz/zstd compressed files supported, e.g., .fna.gz, .fa.bz2, .fasta.xz, .fna.zst)")
                 .required(true)
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
@@ -70,15 +70,6 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("sketch_method")
-                .short('m')
-                .long("sketch-method")
-                .help("Sketch method")
-                .default_value("t1ha2")
-                .value_parser(value_parser!(String))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("canonical")
                 .short('C')
                 .long("canonical")
@@ -92,7 +83,7 @@ fn main() {
                 .short('k')
                 .long("ksize")
                 .help("k-mer size for sketching")
-                .default_value("21")
+                .default_value("16")
                 .value_parser(value_parser!(u8))
                 .action(ArgAction::Set),
         )
@@ -101,7 +92,7 @@ fn main() {
                 .short('S')
                 .long("seed")
                 .help("Hash seed")
-                .default_value("123")
+                .default_value("1447")
                 .value_parser(value_parser!(u64))
                 .action(ArgAction::Set),
         )
@@ -233,15 +224,6 @@ fn main() {
                 .help("Number of threads, default all logical cores")
                 .value_parser(value_parser!(usize))
                 .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("ani_th")
-                .short('a')
-                .long("ani-th")
-                .help("ANI threshold")
-                .default_value("85.0")
-                .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
         );
 
     let matches = Command::new("dotani")
@@ -269,16 +251,13 @@ fn main() {
             path_query_sketch: PathBuf::new(),
             out_file: out_file.clone(),
             ksize: *sketch_m.get_one::<u8>("ksize").unwrap(),
-            sketch_method: sketch_m
-                .get_one::<String>("sketch_method")
-                .cloned()
-                .unwrap(),
+            sketch_method: String::from("t1ha2"),
             canonical: *sketch_m.get_one::<bool>("canonical").unwrap(),
             seed: *sketch_m.get_one::<u64>("seed").unwrap(),
             scaled: 1u64,
             hv_d: *sketch_m.get_one::<usize>("hv_d").unwrap(),
             hv_quant_scale: *sketch_m.get_one::<f32>("quant_scale").unwrap(),
-            ani_threshold: *sketch_m.get_one::<f32>("ani_th").unwrap(),
+            ani_threshold: 0.0,
             if_compressed: true,
             threads,
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
