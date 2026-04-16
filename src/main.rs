@@ -38,7 +38,7 @@ fn default_threads_u8() -> u8 {
 fn main() {
     init_log();
     println!("\n ************** initializing logger *****************\n");
-    log::info!("Logger initialized");
+    log::info!("\nLogger initialized\n");
 
     let sketch_cmd = Command::new(params::CMD_SKETCH)
         .version("0.2.1")

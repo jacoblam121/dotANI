@@ -222,7 +222,8 @@ pub fn ani_from_intersection_and_cardinalities(
         return 0.0;
     }
 
-    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
+    // let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
+    let ani = (2.0 * jaccard as f32 / (1.0 + jaccard as f32)).powf(1.0 / ksize as f32);
 
     if ani.is_nan() {
         0.0
