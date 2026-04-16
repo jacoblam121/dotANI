@@ -123,6 +123,7 @@ impl GpuDotExecutor {
     pub fn new(gpu_id: usize) -> Result<Self> {
         let t0 = Instant::now();
 
+        // In this cudarc version these are already Arc<...>
         let ctx = CudaContext::new(gpu_id)?;
         let ptx = compile_ptx(KERNEL_SRC)?;
         let module = ctx.load_module(ptx)?;
@@ -135,8 +136,8 @@ impl GpuDotExecutor {
 
         Ok(Self {
             gpu_id,
-            ctx: Arc::new(ctx),
-            module: Arc::new(module),
+            ctx,
+            module,
         })
     }
 
