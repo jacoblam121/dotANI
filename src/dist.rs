@@ -222,7 +222,6 @@ pub fn ani_from_intersection_and_cardinalities(
         return 0.0;
     }
 
-    // let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
     let ani = (2.0 * jaccard as f32 / (1.0 + jaccard as f32)).powf(1.0 / ksize as f32);
 
     if ani.is_nan() {
@@ -375,6 +374,15 @@ fn stream_hv_ani_cpu(
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct GpuTileJob {
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+}
+
+#[cfg(feature = "cuda")]
 struct TileBatchResult {
     text: String,
     num_hits: usize,
@@ -404,163 +412,137 @@ fn stream_hv_ani_gpu_multi(
     let ng = device_count()?.max(1);
     info!("Using {} GPU worker(s) for tiled dot-product", ng);
 
-    let mut total_hits = 0usize;
-
+    let mut jobs = Vec::<GpuTileJob>::new();
     for i0 in (0..ref_filesketch.len()).step_by(tile_ref) {
         let i1 = (i0 + tile_ref).min(ref_filesketch.len());
-        let ref_block = &ref_filesketch[i0..i1];
-        let ref_flat = Arc::new(flatten_hv_matrix(ref_block));
-        let nr = ref_block.len();
-
         let j0_start = if if_symmetric { i0 } else { 0 };
 
-        let mut jobs = Vec::<(usize, usize)>::new();
         for j0 in (j0_start..query_filesketch.len()).step_by(tile_query) {
             let j1 = (j0 + tile_query).min(query_filesketch.len());
-            jobs.push((j0, j1));
+            jobs.push(GpuTileJob { i0, i1, j0, j1 });
         }
+    }
 
-        let jobs = Arc::new(jobs);
-        let next = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
+    let total_jobs = jobs.len();
+    let jobs = Arc::new(jobs);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
 
-        std::thread::scope(|scope| {
-            for dev_id in 0..ng {
-                let tx = tx.clone();
-                let jobs = Arc::clone(&jobs);
-                let next = Arc::clone(&next);
-                let ref_flat = Arc::clone(&ref_flat);
+    std::thread::scope(|scope| {
+        for dev_id in 0..ng {
+            let tx = tx.clone();
+            let jobs = Arc::clone(&jobs);
+            let next = Arc::clone(&next);
 
-                scope.spawn(move || {
-                    let worker = || -> anyhow::Result<()> {
-                        let gpu = GpuDotExecutor::new(dev_id)?;
+            scope.spawn(move || {
+                let worker = || -> anyhow::Result<()> {
+                    let gpu = GpuDotExecutor::new(dev_id)?;
 
-                        loop {
-                            let job_idx = next.fetch_add(1, Ordering::Relaxed);
-                            if job_idx >= jobs.len() {
-                                break;
-                            }
+                    let mut cached_i0 = usize::MAX;
+                    let mut cached_i1 = usize::MAX;
+                    let mut cached_ref_flat = Vec::<i32>::new();
+                    let mut cached_nr = 0usize;
 
-                            let (j0, j1) = jobs[job_idx];
-                            let query_block = &query_filesketch[j0..j1];
-                            let query_flat = flatten_hv_matrix(query_block);
-                            let nq = query_block.len();
-
-                            let mut tile_dots = vec![0i64; nq * nr];
-                            gpu.compute_tile(&query_flat, nq, &ref_flat, nr, hv_d, &mut tile_dots)?;
-                            // debug
-                            let should_check_tile =
-                                (i0 == 0 && j0 == 0) ||
-                                (i0 == 0 && j0 > 0) ||
-                                (i0 == j0) ||
-                                (i1 == ref_filesketch.len()) ||
-                                (j1 == query_filesketch.len());
-
-                            if should_check_tile {
-                                let sample_q = [0usize, nq / 2, nq.saturating_sub(1)];
-                                let sample_r = [0usize, nr / 2, nr.saturating_sub(1)];
-
-                                for &q_local in &sample_q {
-                                    if q_local >= nq {
-                                        continue;
-                                    }
-                                    for &r_local in &sample_r {
-                                        if r_local >= nr {
-                                            continue;
-                                        }
-
-                                        let i = i0 + r_local;
-                                        let j = j0 + q_local;
-
-                                        let cpu_dot = compute_pairwise_dot(
-                                            &ref_filesketch[i].hv,
-                                            &query_filesketch[j].hv,
-                                        );
-                                        let gpu_dot = tile_dots[q_local * nr + r_local];
-
-                                        if cpu_dot != gpu_dot {
-                                            panic!(
-                                                "DOT MISMATCH tile(i0={}, j0={}, nq={}, nr={}) \
-                                                at global(i={}, j={}) local(q_local={}, r_local={}) \
-                                                cpu_dot={} gpu_dot={}",
-                                                i0, j0, nq, nr,
-                                                i, j, q_local, r_local,
-                                                cpu_dot, gpu_dot
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            let mut text = String::new();
-                            let mut num_hits = 0usize;
-                            let mut num_pairs_done = 0usize;
-
-                            for q_local in 0..nq {
-                                for r_local in 0..nr {
-                                    let i = i0 + r_local;
-                                    let j = j0 + q_local;
-
-                                    if if_symmetric && i >= j {
-                                        continue;
-                                    }
-
-                                    num_pairs_done += 1;
-
-                                    let dot = tile_dots[q_local * nr + r_local] as f64;
-                                    let inter_hat = dot / hv_d as f64;
-                                    let ani = ani_from_intersection_and_cardinalities(
-                                        inter_hat,
-                                        ref_cards[i],
-                                        query_cards[j],
-                                        ksize,
-                                    );
-
-                                    if ani >= ani_threshold {
-                                        use std::fmt::Write as _;
-                                        let _ = writeln!(
-                                            &mut text,
-                                            "{}\t{}\t{:.3}",
-                                            ref_filesketch[i].file_str,
-                                            query_filesketch[j].file_str,
-                                            ani
-                                        );
-                                        num_hits += 1;
-                                    }
-                                }
-                            }
-
-                            tx.send(Ok(TileBatchResult {
-                                text,
-                                num_hits,
-                                num_pairs_done,
-                            }))
-                            .expect("Failed to send tile batch result");
+                    loop {
+                        let job_idx = next.fetch_add(1, Ordering::Relaxed);
+                        if job_idx >= jobs.len() {
+                            break;
                         }
 
-                        Ok(())
-                    };
+                        let job = jobs[job_idx];
 
-                    if let Err(e) = worker() {
-                        let _ = tx.send(Err(e));
+                        if job.i0 != cached_i0 || job.i1 != cached_i1 {
+                            cached_i0 = job.i0;
+                            cached_i1 = job.i1;
+
+                            let ref_block = &ref_filesketch[job.i0..job.i1];
+                            cached_nr = ref_block.len();
+                            cached_ref_flat = flatten_hv_matrix(ref_block);
+                        }
+
+                        let query_block = &query_filesketch[job.j0..job.j1];
+                        let nq = query_block.len();
+                        let query_flat = flatten_hv_matrix(query_block);
+
+                        let mut tile_dots = vec![0i64; nq * cached_nr];
+                        gpu.compute_tile(
+                            &query_flat,
+                            nq,
+                            &cached_ref_flat,
+                            cached_nr,
+                            hv_d,
+                            &mut tile_dots,
+                        )?;
+
+                        let mut text = String::new();
+                        let mut num_hits = 0usize;
+                        let mut num_pairs_done = 0usize;
+
+                        for q_local in 0..nq {
+                            for r_local in 0..cached_nr {
+                                let i = job.i0 + r_local;
+                                let j = job.j0 + q_local;
+
+                                if if_symmetric && i >= j {
+                                    continue;
+                                }
+
+                                num_pairs_done += 1;
+
+                                let dot = tile_dots[q_local * cached_nr + r_local] as f64;
+                                let inter_hat = dot / hv_d as f64;
+                                let ani = ani_from_intersection_and_cardinalities(
+                                    inter_hat,
+                                    ref_cards[i],
+                                    query_cards[j],
+                                    ksize,
+                                );
+
+                                if ani >= ani_threshold {
+                                    use std::fmt::Write as _;
+                                    let _ = writeln!(
+                                        &mut text,
+                                        "{}\t{}\t{:.3}",
+                                        ref_filesketch[i].file_str,
+                                        query_filesketch[j].file_str,
+                                        ani
+                                    );
+                                    num_hits += 1;
+                                }
+                            }
+                        }
+
+                        tx.send(Ok(TileBatchResult {
+                            text,
+                            num_hits,
+                            num_pairs_done,
+                        }))
+                        .expect("Failed to send tile batch result");
                     }
-                });
-            }
-        });
 
-        drop(tx);
+                    Ok(())
+                };
 
-        for _ in 0..jobs.len() {
-            match rx.recv().expect("GPU worker channel closed unexpectedly") {
-                Ok(batch) => {
-                    writer
-                        .write_all(batch.text.as_bytes())
-                        .expect("Failed to write ANI batch");
-                    total_hits += batch.num_hits;
-                    pb.inc(batch.num_pairs_done as u64);
+                if let Err(e) = worker() {
+                    let _ = tx.send(Err(e));
                 }
-                Err(e) => return Err(e),
+            });
+        }
+    });
+
+    drop(tx);
+
+    let mut total_hits = 0usize;
+    for _ in 0..total_jobs {
+        match rx.recv().expect("GPU worker channel closed unexpectedly") {
+            Ok(batch) => {
+                writer
+                    .write_all(batch.text.as_bytes())
+                    .expect("Failed to write ANI batch");
+                total_hits += batch.num_hits;
+                pb.inc(batch.num_pairs_done as u64);
             }
+            Err(e) => return Err(e),
         }
     }
 
@@ -662,10 +644,10 @@ pub fn compute_hv_ani(
 
     pb.finish_and_clear();
 
-    let total_dist = num_dists as f32;
-    let cnt = num_hits as f32;
-    let perc = if total_dist > 0.0 {
-        cnt / total_dist * 100.0
+    let total_dist = num_dists as u64;
+    let cnt = num_hits as u64;
+    let perc = if total_dist > 0 {
+        (cnt as f64) / (total_dist as f64) * 100.0
     } else {
         0.0
     };

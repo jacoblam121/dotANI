@@ -15,7 +15,7 @@ const KERNEL_SRC: &str = r#"
 #endif
 
 #ifndef BLOCK_K
-#define BLOCK_K 32
+#define BLOCK_K 64
 #endif
 
 extern "C" __global__
@@ -29,8 +29,7 @@ void dot_rect_i32_i64_tiled(
 ) {
     const int local_j = blockIdx.x * blockDim.x + threadIdx.x;
     const int local_i = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (local_i >= nq || local_j >= nr) return;
+    const bool valid = (local_i < nq) && (local_j < nr);
 
     extern __shared__ int smem[];
     int* As = smem;                     // BLOCK_M * BLOCK_K
@@ -44,6 +43,7 @@ void dot_rect_i32_i64_tiled(
     for (int k0 = 0; k0 < d; k0 += BLOCK_K) {
         const int bk = min(BLOCK_K, d - k0);
 
+        // Load A tile
         const int total_a = blockDim.y * bk;
         for (int idx = tid; idx < total_a; idx += nthreads) {
             const int row = idx / bk;
@@ -57,6 +57,7 @@ void dot_rect_i32_i64_tiled(
             As[row * BLOCK_K + kk] = v;
         }
 
+        // Load B tile
         const int total_b = blockDim.x * bk;
         for (int idx = tid; idx < total_b; idx += nthreads) {
             const int col = idx / bk;
@@ -72,25 +73,29 @@ void dot_rect_i32_i64_tiled(
 
         __syncthreads();
 
-        const int arow = threadIdx.y * BLOCK_K;
-        const int brow = threadIdx.x * BLOCK_K;
+        if (valid) {
+            const int arow = threadIdx.y * BLOCK_K;
+            const int brow = threadIdx.x * BLOCK_K;
 
-        int kk = 0;
-        #pragma unroll
-        for (; kk + 3 < bk; kk += 4) {
-            acc += (long long)As[arow + kk + 0] * (long long)Bs[brow + kk + 0];
-            acc += (long long)As[arow + kk + 1] * (long long)Bs[brow + kk + 1];
-            acc += (long long)As[arow + kk + 2] * (long long)Bs[brow + kk + 2];
-            acc += (long long)As[arow + kk + 3] * (long long)Bs[brow + kk + 3];
-        }
-        for (; kk < bk; ++kk) {
-            acc += (long long)As[arow + kk] * (long long)Bs[brow + kk];
+            int kk = 0;
+            #pragma unroll
+            for (; kk + 3 < bk; kk += 4) {
+                acc += (long long)As[arow + kk + 0] * (long long)Bs[brow + kk + 0];
+                acc += (long long)As[arow + kk + 1] * (long long)Bs[brow + kk + 1];
+                acc += (long long)As[arow + kk + 2] * (long long)Bs[brow + kk + 2];
+                acc += (long long)As[arow + kk + 3] * (long long)Bs[brow + kk + 3];
+            }
+            for (; kk < bk; ++kk) {
+                acc += (long long)As[arow + kk] * (long long)Bs[brow + kk];
+            }
         }
 
         __syncthreads();
     }
 
-    out[(size_t)local_i * (size_t)nr + (size_t)local_j] = acc;
+    if (valid) {
+        out[(size_t)local_i * (size_t)nr + (size_t)local_j] = acc;
+    }
 }
 "#;
 
@@ -118,9 +123,9 @@ impl GpuDotExecutor {
     pub fn new(gpu_id: usize) -> Result<Self> {
         let t0 = Instant::now();
 
-        let ctx = CudaContext::new(gpu_id)?;
+        let ctx = Arc::new(CudaContext::new(gpu_id)?);
         let ptx = compile_ptx(KERNEL_SRC)?;
-        let module = ctx.load_module(ptx)?;
+        let module = Arc::new(ctx.load_module(ptx)?);
 
         info!(
             "Initialized GPU dot executor on gpu_id={} in {:.3}s",
@@ -183,7 +188,7 @@ impl GpuDotExecutor {
 
         let blk_x = 16usize;
         let blk_y = 16usize;
-        let blk_k = 32usize;
+        let blk_k = 64usize;
         let smem_bytes = shared_mem_bytes_i32(blk_y, blk_x, blk_k);
 
         let cfg = LaunchConfig {
