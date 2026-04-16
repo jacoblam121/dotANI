@@ -7,13 +7,17 @@ use crate::utils;
 use log::{info, warn};
 use rayon::prelude::*;
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
-use crate::cuda_dot;
+use crate::cuda_dot::{device_count, GpuDotExecutor};
 
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
@@ -85,8 +89,6 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         ksize_ref,
         if_sym,
     );
-
-    utils::dump_ani_file(sketch_dist);
 
     info!(
         "Computed ANIs for {} ref files and {} query files took {:.3}s",
@@ -229,47 +231,25 @@ pub fn ani_from_intersection_and_cardinalities(
     }
 }
 
-pub fn compute_pairwise_ani_with_ull(
-    r: &[i32],
-    q: &[i32],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot(r, q) as f64;
-    let inter_hat = dot / hv_d as f64;
-    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
+#[inline]
+fn write_ani_record<W: Write>(writer: &mut W, ref_name: &str, query_name: &str, ani: f32) {
+    writeln!(writer, "{}\t{}\t{:.3}", ref_name, query_name, ani)
+        .expect("Failed to write ANI record");
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_ani_with_ull_avx2(
-    r: &[i32],
-    q: &[i32],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot_avx2(r, q) as f64;
-    let inter_hat = dot / hv_d as f64;
-    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
-}
+#[inline]
+fn compute_pairwise_dot_best(r: &[i32], q: &[i32]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { compute_pairwise_dot_avx512(r, q) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { compute_pairwise_dot_avx2(r, q) };
+        }
+    }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn compute_pairwise_ani_with_ull_avx512(
-    r: &[i32],
-    q: &[i32],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot_avx512(r, q) as f64;
-    let inter_hat = dot / hv_d as f64;
-    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
+    compute_pairwise_dot(r, q)
 }
 
 #[cfg(feature = "cuda")]
@@ -284,6 +264,222 @@ fn flatten_hv_matrix(filesketch: &[FileSketch]) -> Vec<i32> {
         out.extend_from_slice(&fs.hv);
     }
     out
+}
+
+fn stream_hv_ani_cpu(
+    writer: &mut BufWriter<File>,
+    pb: &indicatif::ProgressBar,
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cards: &[f64],
+    query_cards: &[f64],
+    ksize: u8,
+    if_symmetric: bool,
+    ani_threshold: f32,
+) -> usize {
+    let mut num_hits = 0usize;
+    let mut debug_seen = 0usize;
+
+    for i in 0..ref_filesketch.len() {
+        let j_start = if if_symmetric { i + 1 } else { 0 };
+
+        for j in j_start..query_filesketch.len() {
+            let r = &ref_filesketch[i];
+            let q = &query_filesketch[j];
+
+            let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
+            let inter_hat = dot / r.hv_d as f64;
+            let ani = ani_from_intersection_and_cardinalities(
+                inter_hat,
+                ref_cards[i],
+                query_cards[j],
+                ksize,
+            );
+
+            if debug_seen < 8 {
+                let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
+                let jaccard = if union_hat > 0.0 {
+                    inter_hat / union_hat
+                } else {
+                    -1.0
+                };
+
+                info!(
+                    "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
+                    debug_seen,
+                    r.file_str,
+                    q.file_str,
+                    ref_cards[i],
+                    query_cards[j],
+                    dot,
+                    inter_hat,
+                    union_hat,
+                    jaccard,
+                    ani
+                );
+                debug_seen += 1;
+            }
+
+            if ani >= ani_threshold {
+                write_ani_record(writer, &r.file_str, &q.file_str, ani);
+                num_hits += 1;
+            }
+
+            pb.inc(1);
+        }
+    }
+
+    num_hits
+}
+
+#[cfg(feature = "cuda")]
+struct TileBatchResult {
+    text: String,
+    num_hits: usize,
+    num_pairs_done: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn stream_hv_ani_gpu_multi(
+    writer: &mut BufWriter<File>,
+    pb: &indicatif::ProgressBar,
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cards: &[f64],
+    query_cards: &[f64],
+    ksize: u8,
+    if_symmetric: bool,
+    ani_threshold: f32,
+) -> anyhow::Result<usize> {
+    if ref_filesketch.is_empty() || query_filesketch.is_empty() {
+        return Ok(0);
+    }
+
+    let hv_d = ref_filesketch[0].hv_d;
+    let tile_ref = 256usize;
+    let tile_query = 256usize;
+
+    let ng = device_count()?.max(1);
+    info!("Using {} GPU worker(s) for tiled dot-product", ng);
+
+    let mut total_hits = 0usize;
+
+    for i0 in (0..ref_filesketch.len()).step_by(tile_ref) {
+        let i1 = (i0 + tile_ref).min(ref_filesketch.len());
+        let ref_block = &ref_filesketch[i0..i1];
+        let ref_flat = Arc::new(flatten_hv_matrix(ref_block));
+        let nr = ref_block.len();
+
+        let j0_start = if if_symmetric { i0 } else { 0 };
+
+        let mut jobs = Vec::<(usize, usize)>::new();
+        for j0 in (j0_start..query_filesketch.len()).step_by(tile_query) {
+            let j1 = (j0 + tile_query).min(query_filesketch.len());
+            jobs.push((j0, j1));
+        }
+
+        let jobs = Arc::new(jobs);
+        let next = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
+
+        std::thread::scope(|scope| {
+            for dev_id in 0..ng {
+                let tx = tx.clone();
+                let jobs = Arc::clone(&jobs);
+                let next = Arc::clone(&next);
+                let ref_flat = Arc::clone(&ref_flat);
+
+                scope.spawn(move || {
+                    let worker = || -> anyhow::Result<()> {
+                        let gpu = GpuDotExecutor::new(dev_id)?;
+
+                        loop {
+                            let job_idx = next.fetch_add(1, Ordering::Relaxed);
+                            if job_idx >= jobs.len() {
+                                break;
+                            }
+
+                            let (j0, j1) = jobs[job_idx];
+                            let query_block = &query_filesketch[j0..j1];
+                            let query_flat = flatten_hv_matrix(query_block);
+                            let nq = query_block.len();
+
+                            let mut tile_dots = vec![0i64; nq * nr];
+                            gpu.compute_tile(&query_flat, nq, &ref_flat, nr, hv_d, &mut tile_dots)?;
+
+                            let mut text = String::new();
+                            let mut num_hits = 0usize;
+                            let mut num_pairs_done = 0usize;
+
+                            for q_local in 0..nq {
+                                for r_local in 0..nr {
+                                    let i = i0 + r_local;
+                                    let j = j0 + q_local;
+
+                                    if if_symmetric && i >= j {
+                                        continue;
+                                    }
+
+                                    num_pairs_done += 1;
+
+                                    let dot = tile_dots[q_local * nr + r_local] as f64;
+                                    let inter_hat = dot / hv_d as f64;
+                                    let ani = ani_from_intersection_and_cardinalities(
+                                        inter_hat,
+                                        ref_cards[i],
+                                        query_cards[j],
+                                        ksize,
+                                    );
+
+                                    if ani >= ani_threshold {
+                                        use std::fmt::Write as _;
+                                        let _ = writeln!(
+                                            &mut text,
+                                            "{}\t{}\t{:.3}",
+                                            ref_filesketch[i].file_str,
+                                            query_filesketch[j].file_str,
+                                            ani
+                                        );
+                                        num_hits += 1;
+                                    }
+                                }
+                            }
+
+                            tx.send(Ok(TileBatchResult {
+                                text,
+                                num_hits,
+                                num_pairs_done,
+                            }))
+                            .expect("Failed to send tile batch result");
+                        }
+
+                        Ok(())
+                    };
+
+                    if let Err(e) = worker() {
+                        let _ = tx.send(Err(e));
+                    }
+                });
+            }
+        });
+
+        drop(tx);
+
+        for _ in 0..jobs.len() {
+            match rx.recv().expect("GPU worker channel closed unexpectedly") {
+                Ok(batch) => {
+                    writer
+                        .write_all(batch.text.as_bytes())
+                        .expect("Failed to write ANI batch");
+                    total_hits += batch.num_hits;
+                    pb.inc(batch.num_pairs_done as u64);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(total_hits)
 }
 
 pub fn compute_hv_ani(
@@ -322,175 +518,84 @@ pub fn compute_hv_ani(
             .collect()
     };
 
-    let mut cnt = 0usize;
-    let mut index_dist = vec![(0usize, 0usize); num_dists];
-    for i in 0..num_ref_files {
-        for j in (if if_symmetric { i + 1 } else { 0 })..num_query_files {
-            index_dist[cnt] = (i, j);
-            cnt += 1;
-        }
-    }
+    let out_file = File::create(sketch_dist.out_file.as_path())
+        .expect("Failed to create ANI output file");
+    let mut writer = BufWriter::new(out_file);
 
-    sketch_dist.file_ani = vec![(("".to_string(), "".to_string()), 0.0); num_dists];
-
-    #[cfg(feature = "cuda")]
-    {
-        let hv_d = ref_filesketch[0].hv_d;
-        let query_flat = flatten_hv_matrix(query_filesketch);
-        let ref_flat = flatten_hv_matrix(ref_filesketch);
-        let mut dot_matrix = vec![0i64; num_query_files * num_ref_files];
-
-        match cuda_dot::pairwise_dot_rect_multi_gpu_i32(
-            &query_flat,
-            num_query_files,
-            &ref_flat,
-            num_ref_files,
-            hv_d,
-            &mut dot_matrix,
-            256,
-            256,
-        ) {
-            Ok(()) => {
-                info!("GPU dot-product completed successfully");
-
-                sketch_dist
-                    .file_ani
-                    .par_iter_mut()
-                    .enumerate()
-                    .zip(index_dist.into_par_iter())
-                    .for_each(|((pair_idx, file_ani_pair), (i, j))| {
-                        let dot = dot_matrix[j * num_ref_files + i] as f64;
-                        let inter_hat = dot / hv_d as f64;
-                        let ani = ani_from_intersection_and_cardinalities(
-                            inter_hat,
-                            ref_cards[i],
-                            query_cards[j],
-                            ksize,
-                        );
-
-                        if pair_idx < 8 {
-                            let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
-                            let jaccard = if union_hat > 0.0 {
-                                inter_hat / union_hat
-                            } else {
-                                -1.0
-                            };
-
-                            info!(
-                                "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
-                                pair_idx,
-                                ref_filesketch[i].file_str,
-                                query_filesketch[j].file_str,
-                                ref_cards[i],
-                                query_cards[j],
-                                dot,
-                                inter_hat,
-                                union_hat,
-                                jaccard,
-                                ani
-                            );
-                        }
-
-                        *file_ani_pair = (
-                            (
-                                ref_filesketch[i].file_str.clone(),
-                                query_filesketch[j].file_str.clone(),
-                            ),
-                            ani,
-                        );
-
-                        pb.inc(1);
-                        pb.eta();
-                    });
-
-                pb.finish_and_clear();
-                return;
-            }
-            Err(e) => {
-                warn!("GPU dot-product failed, falling back to CPU: {e:?}");
+    let num_hits = {
+        #[cfg(feature = "cuda")]
+        {
+            match stream_hv_ani_gpu_multi(
+                &mut writer,
+                &pb,
+                ref_filesketch,
+                query_filesketch,
+                &ref_cards,
+                &query_cards,
+                ksize,
+                if_symmetric,
+                sketch_dist.ani_threshold,
+            ) {
+                Ok(n) => {
+                    info!("Multi-GPU tiled dot-product completed successfully");
+                    n
+                }
+                Err(e) => {
+                    warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
+                    stream_hv_ani_cpu(
+                        &mut writer,
+                        &pb,
+                        ref_filesketch,
+                        query_filesketch,
+                        &ref_cards,
+                        &query_cards,
+                        ksize,
+                        if_symmetric,
+                        sketch_dist.ani_threshold,
+                    )
+                }
             }
         }
-    }
 
-    sketch_dist
-        .file_ani
-        .par_iter_mut()
-        .enumerate()
-        .zip(index_dist.into_par_iter())
-        .for_each(|((pair_idx, file_ani_pair), ind)| {
-            let r = &ref_filesketch[ind.0];
-            let q = &query_filesketch[ind.1];
+        #[cfg(not(feature = "cuda"))]
+        {
+            stream_hv_ani_cpu(
+                &mut writer,
+                &pb,
+                ref_filesketch,
+                query_filesketch,
+                &ref_cards,
+                &query_cards,
+                ksize,
+                if_symmetric,
+                sketch_dist.ani_threshold,
+            )
+        }
+    };
 
-            let card_r = ref_cards[ind.0];
-            let card_q = query_cards[ind.1];
-
-            let (dot, ani) = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if is_x86_feature_detected!("avx512f") {
-                        let dot = unsafe { compute_pairwise_dot_avx512(&r.hv, &q.hv) as f64 };
-                        let ani = unsafe {
-                            compute_pairwise_ani_with_ull_avx512(
-                                &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                            )
-                        };
-                        (dot, ani)
-                    } else if is_x86_feature_detected!("avx2") {
-                        let dot = unsafe { compute_pairwise_dot_avx2(&r.hv, &q.hv) as f64 };
-                        let ani = unsafe {
-                            compute_pairwise_ani_with_ull_avx2(
-                                &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                            )
-                        };
-                        (dot, ani)
-                    } else {
-                        let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
-                        let ani = compute_pairwise_ani_with_ull(
-                            &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                        );
-                        (dot, ani)
-                    }
-                }
-
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
-                    let ani = compute_pairwise_ani_with_ull(
-                        &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                    );
-                    (dot, ani)
-                }
-            };
-
-            if pair_idx < 8 {
-                let inter_hat = dot / r.hv_d as f64;
-                let union_hat = card_r + card_q - inter_hat;
-                let jaccard = if union_hat > 0.0 {
-                    inter_hat / union_hat
-                } else {
-                    -1.0
-                };
-
-                info!(
-                    "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
-                    pair_idx,
-                    r.file_str,
-                    q.file_str,
-                    card_r,
-                    card_q,
-                    dot,
-                    inter_hat,
-                    union_hat,
-                    jaccard,
-                    ani
-                );
-            }
-
-            *file_ani_pair = ((r.file_str.clone(), q.file_str.clone()), ani);
-
-            pb.inc(1);
-            pb.eta();
-        });
-
+    writer.flush().expect("Failed to flush ANI output");
     pb.finish_and_clear();
+
+    let total_dist = num_dists as f32;
+    let cnt = num_hits as f32;
+    let perc = if total_dist > 0.0 {
+        cnt / total_dist * 100.0
+    } else {
+        0.0
+    };
+
+    if perc < 5.0 {
+        warn!(
+            "Output ANIs with threshold {:.1} are too divergent: {} of {} ({:.2}%) ANIs are reported",
+            sketch_dist.ani_threshold, cnt, total_dist, perc
+        );
+    } else {
+        info!(
+            "Output {} of {} ANIs above threshold {:.1} to file {}",
+            cnt,
+            total_dist,
+            sketch_dist.ani_threshold,
+            sketch_dist.out_file.to_string_lossy()
+        );
+    }
 }
