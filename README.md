@@ -36,15 +36,20 @@ Current version supports following functions:
 Example:
 dotani sketch -p ./data -o ./fna.sketch
 
-Positional arguments:
--p, --path <PATH>               Input folder path to sketch
--o, --out <OUT>                 Output path 
--t, --thread <THREAD>           Threads used for computation [default: 16]
--C, --canonical <CANONICAL>     If use canonical kmer [default: true]
--k, --ksize <KSIZE>             k-mer size for sketching [default: 21]
--s, --scaled <SCALED>           Scaled factor for FracMinHash [default: 1500]
--d, --hv_d <HD_D>               Dimension for hypervector [default: 4096]
--D, --device <DEVICE>           Device to run [default: cpu] [possible values: cpu, gpu]
+Usage: dotani sketch [OPTIONS] --path <path> --out <out>
+
+Options:
+  -p, --path <path>                Input folder path containing .fna/.fa/.fasta files (gzip/bzip2/xz/zstd compressed files supported, e.g., .fna.gz, .fa.bz2, .fasta.xz, .fna.zst)
+  -o, --out <out>                  Output DotHash sketch file
+  -T, --threads <threads>          Number of threads, default all logical cores
+  -C, --canonical <canonical>      Whether to use canonical k-mers [default: true] [possible values: true, false]
+  -k, --ksize <ksize>              k-mer size for sketching [default: 16]
+  -S, --seed <seed>                Hash seed [default: 1447]
+      --ull-p <ull_p>              UltraLogLog precision parameter [default: 14]
+  -d, --hv-d <hv_d>                Dimension for hypervector [default: 4096]
+  -Q, --quant-scale <quant_scale>  Scaling factor for HV quantization [default: 1.0]
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 
@@ -65,5 +70,6 @@ Positional arguments:
 
 _dotANI_ supports offloading the kmer hashing and sampling steps to GPU to speed up the sketching process. Use the following command to run on GPU device:
 ```sh
-dotani sketch -D gpu -p ./data -o ./fna.sketch
+dotani-cuda sketch -p ./data -o ./fna.sketch
+dotani-cuda dist -r fna1.sketch -q fna2.sketch -o output.ani
 ```
