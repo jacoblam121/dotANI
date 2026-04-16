@@ -123,9 +123,9 @@ impl GpuDotExecutor {
     pub fn new(gpu_id: usize) -> Result<Self> {
         let t0 = Instant::now();
 
-        let ctx = Arc::new(CudaContext::new(gpu_id)?);
+        let ctx = CudaContext::new(gpu_id)?;
         let ptx = compile_ptx(KERNEL_SRC)?;
-        let module = Arc::new(ctx.load_module(ptx)?);
+        let module = ctx.load_module(ptx)?;
 
         info!(
             "Initialized GPU dot executor on gpu_id={} in {:.3}s",
@@ -135,8 +135,8 @@ impl GpuDotExecutor {
 
         Ok(Self {
             gpu_id,
-            ctx,
-            module,
+            ctx: Arc::new(ctx),
+            module: Arc::new(module),
         })
     }
 
