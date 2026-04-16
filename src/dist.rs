@@ -449,9 +449,26 @@ fn stream_hv_ani_gpu_multi(
                             let mut tile_dots = vec![0i64; nq * nr];
                             gpu.compute_tile(&query_flat, nq, &ref_flat, nr, hv_d, &mut tile_dots)?;
                             // debug
-                            if i0 == 0 && j0 == 0 {
-                                for q_local in 0..nq.min(16) {
-                                    for r_local in 0..nr.min(16) {
+                            let should_check_tile =
+                                (i0 == 0 && j0 == 0) ||
+                                (i0 == 0 && j0 > 0) ||
+                                (i0 == j0) ||
+                                (i1 == ref_filesketch.len()) ||
+                                (j1 == query_filesketch.len());
+
+                            if should_check_tile {
+                                let sample_q = [0usize, nq / 2, nq.saturating_sub(1)];
+                                let sample_r = [0usize, nr / 2, nr.saturating_sub(1)];
+
+                                for &q_local in &sample_q {
+                                    if q_local >= nq {
+                                        continue;
+                                    }
+                                    for &r_local in &sample_r {
+                                        if r_local >= nr {
+                                            continue;
+                                        }
+
                                         let i = i0 + r_local;
                                         let j = j0 + q_local;
 
@@ -463,8 +480,12 @@ fn stream_hv_ani_gpu_multi(
 
                                         if cpu_dot != gpu_dot {
                                             panic!(
-                                                "DOT MISMATCH at i={} j={} q_local={} r_local={} cpu_dot={} gpu_dot={}",
-                                                i, j, q_local, r_local, cpu_dot, gpu_dot
+                                                "DOT MISMATCH tile(i0={}, j0={}, nq={}, nr={}) \
+                                                at global(i={}, j={}) local(q_local={}, r_local={}) \
+                                                cpu_dot={} gpu_dot={}",
+                                                i0, j0, nq, nr,
+                                                i, j, q_local, r_local,
+                                                cpu_dot, gpu_dot
                                             );
                                         }
                                     }
