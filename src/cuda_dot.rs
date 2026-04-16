@@ -128,7 +128,7 @@ impl GpuDotExecutor {
         let ptx = compile_ptx(KERNEL_SRC)?;
         let module = ctx.load_module(ptx)?;
 
-        info!(
+        log::debug!(
             "Initialized GPU dot executor on gpu_id={} in {:.3}s",
             gpu_id,
             t0.elapsed().as_secs_f64()
@@ -213,7 +213,7 @@ impl GpuDotExecutor {
         unsafe { launch.launch(cfg) }?;
         stream.memcpy_dtoh(&d_out, out)?;
 
-        info!(
+        log::debug!(
             "GPU dot tile done on gpu_id={} nq={} nr={} d={} query={:.2} MiB ref={:.2} MiB out={:.2} MiB in {:.3}s",
             self.gpu_id,
             nq,
