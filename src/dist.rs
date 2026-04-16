@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
@@ -135,8 +135,8 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
     for i in 0..n8 {
         let base = i * 8;
 
-        let vr = _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i);
-        let vq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
+        let vr = unsafe { _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i) };
+        let vq = unsafe { _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i) };
 
         let prod_even = _mm256_mul_epi32(vr, vq);
 
@@ -150,7 +150,7 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
 
     let acc = _mm256_add_epi64(acc_even, acc_odd);
     let mut tmp = [0i64; 4];
-    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc);
+    unsafe { _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc) };
 
     let mut sum = tmp.iter().sum::<i64>();
 
@@ -175,8 +175,8 @@ pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
     for i in 0..n16 {
         let base = i * 16;
 
-        let vr = _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i);
-        let vq = _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i);
+        let vr = unsafe { _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i) };
+        let vq = unsafe { _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i) };
 
         let prod_even = _mm512_mul_epi32(vr, vq);
 
@@ -190,7 +190,7 @@ pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
 
     let acc = _mm512_add_epi64(acc_even, acc_odd);
     let mut tmp = [0i64; 8];
-    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc);
+    unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc) };
 
     let mut sum = tmp.iter().sum::<i64>();
 
@@ -232,12 +232,6 @@ pub fn ani_from_intersection_and_cardinalities(
 }
 
 #[inline]
-fn write_ani_record<W: Write>(writer: &mut W, ref_name: &str, query_name: &str, ani: f32) {
-    writeln!(writer, "{}\t{}\t{:.3}", ref_name, query_name, ani)
-        .expect("Failed to write ANI record");
-}
-
-#[inline]
 fn compute_pairwise_dot_best(r: &[i32], q: &[i32]) -> i64 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -267,7 +261,7 @@ fn flatten_hv_matrix(filesketch: &[FileSketch]) -> Vec<i32> {
 }
 
 fn stream_hv_ani_cpu(
-    writer: &mut BufWriter<File>,
+    out_path: &std::path::Path,
     pb: &indicatif::ProgressBar,
     ref_filesketch: &[FileSketch],
     query_filesketch: &[FileSketch],
@@ -277,59 +271,106 @@ fn stream_hv_ani_cpu(
     if_symmetric: bool,
     ani_threshold: f32,
 ) -> usize {
-    let mut num_hits = 0usize;
-    let mut debug_seen = 0usize;
+    const ROW_BLOCK: usize = 32;
+    const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 
-    for i in 0..ref_filesketch.len() {
-        let j_start = if if_symmetric { i + 1 } else { 0 };
+    let writer = Arc::new(Mutex::new(BufWriter::new(
+        File::create(out_path).expect("Failed to create ANI output file"),
+    )));
+    let total_hits = AtomicUsize::new(0);
+    let debug_seen = AtomicUsize::new(0);
 
-        for j in j_start..query_filesketch.len() {
-            let r = &ref_filesketch[i];
-            let q = &query_filesketch[j];
+    let row_starts: Vec<usize> = (0..ref_filesketch.len()).step_by(ROW_BLOCK).collect();
 
-            let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
-            let inter_hat = dot / r.hv_d as f64;
-            let ani = ani_from_intersection_and_cardinalities(
-                inter_hat,
-                ref_cards[i],
-                query_cards[j],
-                ksize,
-            );
+    row_starts.into_par_iter().for_each(|i0| {
+        let i1 = (i0 + ROW_BLOCK).min(ref_filesketch.len());
 
-            if debug_seen < 8 {
-                let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
-                let jaccard = if union_hat > 0.0 {
-                    inter_hat / union_hat
-                } else {
-                    -1.0
-                };
+        let mut local_text = String::with_capacity(1 << 20);
+        let mut local_hits = 0usize;
+        let mut local_pairs_done = 0usize;
 
-                info!(
-                    "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
-                    debug_seen,
-                    r.file_str,
-                    q.file_str,
+        for i in i0..i1 {
+            let j_start = if if_symmetric { i + 1 } else { 0 };
+
+            for j in j_start..query_filesketch.len() {
+                let r = &ref_filesketch[i];
+                let q = &query_filesketch[j];
+
+                let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
+                let inter_hat = dot / r.hv_d as f64;
+                let ani = ani_from_intersection_and_cardinalities(
+                    inter_hat,
                     ref_cards[i],
                     query_cards[j],
-                    dot,
-                    inter_hat,
-                    union_hat,
-                    jaccard,
-                    ani
+                    ksize,
                 );
-                debug_seen += 1;
-            }
 
-            if ani >= ani_threshold {
-                write_ani_record(writer, &r.file_str, &q.file_str, ani);
-                num_hits += 1;
-            }
+                let dbg_idx = debug_seen.fetch_add(1, Ordering::Relaxed);
+                if dbg_idx < 8 {
+                    let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
+                    let jaccard = if union_hat > 0.0 {
+                        inter_hat / union_hat
+                    } else {
+                        -1.0
+                    };
 
-            pb.inc(1);
+                    info!(
+                        "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
+                        dbg_idx,
+                        r.file_str,
+                        q.file_str,
+                        ref_cards[i],
+                        query_cards[j],
+                        dot,
+                        inter_hat,
+                        union_hat,
+                        jaccard,
+                        ani
+                    );
+                }
+
+                if ani >= ani_threshold {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        &mut local_text,
+                        "{}\t{}\t{:.3}",
+                        r.file_str,
+                        q.file_str,
+                        ani
+                    );
+                    local_hits += 1;
+                }
+
+                local_pairs_done += 1;
+
+                if local_text.len() >= FLUSH_BYTES {
+                    let mut guard = writer.lock().expect("ANI writer mutex poisoned");
+                    guard
+                        .write_all(local_text.as_bytes())
+                        .expect("Failed to write ANI batch");
+                    local_text.clear();
+                }
+            }
         }
-    }
 
-    num_hits
+        if !local_text.is_empty() {
+            let mut guard = writer.lock().expect("ANI writer mutex poisoned");
+            guard
+                .write_all(local_text.as_bytes())
+                .expect("Failed to write ANI batch");
+        }
+
+        total_hits.fetch_add(local_hits, Ordering::Relaxed);
+        pb.inc(local_pairs_done as u64);
+    });
+
+    writer
+        .lock()
+        .expect("ANI writer mutex poisoned")
+        .flush()
+        .expect("Failed to flush ANI output");
+
+    total_hits.load(Ordering::Relaxed)
 }
 
 #[cfg(feature = "cuda")]
@@ -518,13 +559,13 @@ pub fn compute_hv_ani(
             .collect()
     };
 
-    let out_file = File::create(sketch_dist.out_file.as_path())
-        .expect("Failed to create ANI output file");
-    let mut writer = BufWriter::new(out_file);
-
     let num_hits = {
         #[cfg(feature = "cuda")]
         {
+            let out_file = File::create(sketch_dist.out_file.as_path())
+                .expect("Failed to create ANI output file");
+            let mut writer = BufWriter::new(out_file);
+
             match stream_hv_ani_gpu_multi(
                 &mut writer,
                 &pb,
@@ -537,13 +578,15 @@ pub fn compute_hv_ani(
                 sketch_dist.ani_threshold,
             ) {
                 Ok(n) => {
+                    writer.flush().expect("Failed to flush ANI output");
                     info!("Multi-GPU tiled dot-product completed successfully");
                     n
                 }
                 Err(e) => {
                     warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
+                    drop(writer);
                     stream_hv_ani_cpu(
-                        &mut writer,
+                        sketch_dist.out_file.as_path(),
                         &pb,
                         ref_filesketch,
                         query_filesketch,
@@ -560,7 +603,7 @@ pub fn compute_hv_ani(
         #[cfg(not(feature = "cuda"))]
         {
             stream_hv_ani_cpu(
-                &mut writer,
+                sketch_dist.out_file.as_path(),
                 &pb,
                 ref_filesketch,
                 query_filesketch,
@@ -573,7 +616,6 @@ pub fn compute_hv_ani(
         }
     };
 
-    writer.flush().expect("Failed to flush ANI output");
     pb.finish_and_clear();
 
     let total_dist = num_dists as f32;
