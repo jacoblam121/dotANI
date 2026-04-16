@@ -41,7 +41,7 @@ fn main() {
     log::info!("\nLogger initialized\n");
 
     let sketch_cmd = Command::new(params::CMD_SKETCH)
-        .version("0.2.1")
+        .version("0.3.0")
         .about("Sketch genome FASTA files into DotHash and UltraLogLog sketches")
         .arg(
             Arg::new("path")
