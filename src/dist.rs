@@ -234,16 +234,6 @@ pub fn ani_from_intersection_and_cardinalities(
 
 #[inline]
 fn compute_pairwise_dot_best(r: &[i32], q: &[i32]) -> i64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { compute_pairwise_dot_avx512(r, q) };
-        }
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { compute_pairwise_dot_avx2(r, q) };
-        }
-    }
-
     compute_pairwise_dot(r, q)
 }
 
