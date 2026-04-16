@@ -448,6 +448,28 @@ fn stream_hv_ani_gpu_multi(
 
                             let mut tile_dots = vec![0i64; nq * nr];
                             gpu.compute_tile(&query_flat, nq, &ref_flat, nr, hv_d, &mut tile_dots)?;
+                            // debug
+                            if i0 == 0 && j0 == 0 {
+                                for q_local in 0..nq.min(16) {
+                                    for r_local in 0..nr.min(16) {
+                                        let i = i0 + r_local;
+                                        let j = j0 + q_local;
+
+                                        let cpu_dot = compute_pairwise_dot(
+                                            &ref_filesketch[i].hv,
+                                            &query_filesketch[j].hv,
+                                        );
+                                        let gpu_dot = tile_dots[q_local * nr + r_local];
+
+                                        if cpu_dot != gpu_dot {
+                                            panic!(
+                                                "DOT MISMATCH at i={} j={} q_local={} r_local={} cpu_dot={} gpu_dot={}",
+                                                i, j, q_local, r_local, cpu_dot, gpu_dot
+                                            );
+                                        }
+                                    }
+                                }
+                            }
 
                             let mut text = String::new();
                             let mut num_hits = 0usize;
