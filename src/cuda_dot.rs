@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const KERNEL_SRC: &str = r#"
-
 #ifndef BLOCK_M
 #define BLOCK_M 64
 #endif
@@ -34,6 +33,10 @@ const KERNEL_SRC: &str = r#"
 #define PAD_B 1
 #endif
 
+struct __align__(16) Int4 {
+    int x, y, z, w;
+};
+
 extern "C" __global__
 void dot_rect_i32_i64_tiled_rb(
     const int* __restrict__ query_hv,   // [nq * d]
@@ -43,8 +46,6 @@ void dot_rect_i32_i64_tiled_rb(
     int d,
     long long* __restrict__ out         // [nq * nr], row-major
 ) {
-    // blockDim.x = BLOCK_N / THREAD_N = 16
-    // blockDim.y = BLOCK_M / THREAD_M = 16
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
 
@@ -57,12 +58,12 @@ void dot_rect_i32_i64_tiled_rb(
     const int global_row0 = block_row + local_row0;
     const int global_col0 = block_col + local_col0;
 
-    constexpr int STRIDE_A = BLOCK_K + PAD_A;
-    constexpr int STRIDE_B = BLOCK_K + PAD_B;
+    const int STRIDE_A = BLOCK_K + PAD_A;
+    const int STRIDE_B = BLOCK_K + PAD_B;
 
     extern __shared__ int smem[];
-    int* As = smem;                                   // [BLOCK_M * STRIDE_A]
-    int* Bs = As + (BLOCK_M * STRIDE_A);             // [BLOCK_N * STRIDE_B]
+    int* As = smem;
+    int* Bs = As + (BLOCK_M * STRIDE_A);
 
     long long acc[THREAD_M][THREAD_N];
     #pragma unroll
@@ -77,12 +78,9 @@ void dot_rect_i32_i64_tiled_rb(
     const int nthreads = blockDim.x * blockDim.y;
 
     for (int k0 = 0; k0 < d; k0 += BLOCK_K) {
-        const int bk = min(BLOCK_K, d - k0);
+        const int bk = ((BLOCK_K < (d - k0)) ? BLOCK_K : (d - k0));
 
-        // -----------------------------
-        // Load A tile [BLOCK_M x bk]
-        // Vectorized int4 global loads when possible
-        // -----------------------------
+        // Load A tile
         const int vec_bk = bk / 4;
         const int total_a_vec = BLOCK_M * vec_bk;
 
@@ -91,11 +89,13 @@ void dot_rect_i32_i64_tiled_rb(
             const int kk4 = (idx - row * vec_bk) * 4;
 
             const int g_row = block_row + row;
-            int4 v = make_int4(0, 0, 0, 0);
+
+            Int4 v;
+            v.x = 0; v.y = 0; v.z = 0; v.w = 0;
 
             if (g_row < nq) {
-                const int* gptr = query_hv + (size_t)g_row * (size_t)d + (size_t)(k0 + kk4);
-                v = *reinterpret_cast<const int4*>(gptr);
+                const Int4* gptr = (const Int4*)(query_hv + (size_t)g_row * (size_t)d + (size_t)(k0 + kk4));
+                v = *gptr;
             }
 
             int* sptr = As + row * STRIDE_A + kk4;
@@ -105,25 +105,24 @@ void dot_rect_i32_i64_tiled_rb(
             sptr[3] = v.w;
         }
 
-        // Scalar tail if bk % 4 != 0
         const int kk_tail_a = vec_bk * 4;
-        const int total_a_tail = BLOCK_M * (bk - kk_tail_a);
-        for (int idx = tid; idx < total_a_tail; idx += nthreads) {
-            const int row = idx / (bk - kk_tail_a);
-            const int kk  = kk_tail_a + (idx - row * (bk - kk_tail_a));
+        if (bk > kk_tail_a) {
+            const int tail_cols = bk - kk_tail_a;
+            const int total_a_tail = BLOCK_M * tail_cols;
+            for (int idx = tid; idx < total_a_tail; idx += nthreads) {
+                const int row = idx / tail_cols;
+                const int kk  = kk_tail_a + (idx - row * tail_cols);
 
-            const int g_row = block_row + row;
-            int v = 0;
-            if (g_row < nq) {
-                v = query_hv[(size_t)g_row * (size_t)d + (size_t)(k0 + kk)];
+                const int g_row = block_row + row;
+                int v = 0;
+                if (g_row < nq) {
+                    v = query_hv[(size_t)g_row * (size_t)d + (size_t)(k0 + kk)];
+                }
+                As[row * STRIDE_A + kk] = v;
             }
-            As[row * STRIDE_A + kk] = v;
         }
 
-        // -----------------------------
-        // Load B tile [BLOCK_N x bk]
-        // Vectorized int4 global loads when possible
-        // -----------------------------
+        // Load B tile
         const int total_b_vec = BLOCK_N * vec_bk;
 
         for (int idx = tid; idx < total_b_vec; idx += nthreads) {
@@ -131,11 +130,13 @@ void dot_rect_i32_i64_tiled_rb(
             const int kk4 = (idx - col * vec_bk) * 4;
 
             const int g_col = block_col + col;
-            int4 v = make_int4(0, 0, 0, 0);
+
+            Int4 v;
+            v.x = 0; v.y = 0; v.z = 0; v.w = 0;
 
             if (g_col < nr) {
-                const int* gptr = ref_hv + (size_t)g_col * (size_t)d + (size_t)(k0 + kk4);
-                v = *reinterpret_cast<const int4*>(gptr);
+                const Int4* gptr = (const Int4*)(ref_hv + (size_t)g_col * (size_t)d + (size_t)(k0 + kk4));
+                v = *gptr;
             }
 
             int* sptr = Bs + col * STRIDE_B + kk4;
@@ -146,26 +147,25 @@ void dot_rect_i32_i64_tiled_rb(
         }
 
         const int kk_tail_b = vec_bk * 4;
-        const int total_b_tail = BLOCK_N * (bk - kk_tail_b);
-        for (int idx = tid; idx < total_b_tail; idx += nthreads) {
-            const int col = idx / (bk - kk_tail_b);
-            const int kk  = kk_tail_b + (idx - col * (bk - kk_tail_b));
+        if (bk > kk_tail_b) {
+            const int tail_cols = bk - kk_tail_b;
+            const int total_b_tail = BLOCK_N * tail_cols;
+            for (int idx = tid; idx < total_b_tail; idx += nthreads) {
+                const int col = idx / tail_cols;
+                const int kk  = kk_tail_b + (idx - col * tail_cols);
 
-            const int g_col = block_col + col;
-            int v = 0;
-            if (g_col < nr) {
-                v = ref_hv[(size_t)g_col * (size_t)d + (size_t)(k0 + kk)];
+                const int g_col = block_col + col;
+                int v = 0;
+                if (g_col < nr) {
+                    v = ref_hv[(size_t)g_col * (size_t)d + (size_t)(k0 + kk)];
+                }
+                Bs[col * STRIDE_B + kk] = v;
             }
-            Bs[col * STRIDE_B + kk] = v;
         }
 
         __syncthreads();
 
-        // -----------------------------
-        // Compute micro-tile in registers
-        // Each thread computes THREAD_M x THREAD_N = 4 x 2 outputs
-        // -----------------------------
-        #pragma unroll 4
+        #pragma unroll
         for (int kk = 0; kk < BLOCK_K; ++kk) {
             if (kk >= bk) break;
 
@@ -194,9 +194,6 @@ void dot_rect_i32_i64_tiled_rb(
         __syncthreads();
     }
 
-    // -----------------------------
-    // Store results
-    // -----------------------------
     #pragma unroll
     for (int i = 0; i < THREAD_M; ++i) {
         const int g_row = global_row0 + i;
