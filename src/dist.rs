@@ -406,8 +406,8 @@ fn stream_hv_ani_gpu_multi(
     }
 
     let hv_d = ref_filesketch[0].hv_d;
-    let tile_ref = 256usize;
-    let tile_query = 256usize;
+    let tile_ref = 512usize;
+    let tile_query = 512usize;
 
     let ng = device_count()?.max(1);
     info!("Using {} GPU worker(s) for tiled dot-product", ng);
@@ -436,7 +436,7 @@ fn stream_hv_ani_gpu_multi(
 
             scope.spawn(move || {
                 let worker = || -> anyhow::Result<()> {
-                    let gpu = GpuDotExecutor::new(dev_id)?;
+                    let mut gpu = GpuDotExecutor::new(dev_id)?;
 
                     let mut cached_i0 = usize::MAX;
                     let mut cached_i1 = usize::MAX;
