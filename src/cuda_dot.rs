@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const KERNEL_SRC: &str = r#"
-#include <stdint.h>
 
 #ifndef BLOCK_M
 #define BLOCK_M 64
