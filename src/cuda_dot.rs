@@ -409,7 +409,7 @@ impl GpuDotExecutor {
         launch.arg(&nq_i32);
         launch.arg(&nr_i32);
         launch.arg(&d_i32);
-        launch.arg(d_out);
+        launch.arg(&mut *d_out);
 
         unsafe { launch.launch(cfg) }?;
 
