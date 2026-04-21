@@ -34,7 +34,13 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
             .map(|f| f.unwrap())
             .collect();
 
+        let mut recursive_files: Vec<_> = glob(path.join("**").join(pattern).to_str().unwrap())
+            .expect("Failed to read glob pattern")
+            .map(|f| f.unwrap())
+            .collect();
+
         all_files.append(&mut files);
+        all_files.append(&mut recursive_files);
     }
 
     all_files.sort();
