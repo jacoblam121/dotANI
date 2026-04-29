@@ -16,8 +16,14 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use rand::{RngCore, SeedableRng};
+    use wyhash::WyRng;
+
     use crate::types::FileSketch;
     use crate::{dist, hd, utils};
+
+    const WY_P0: u64 = 0xa076_1d64_78bd_642f;
+    const WY_P1: u64 = 0xe703_7ed1_a0b4_28db;
 
     fn sketch_for_hv(hv_d: usize) -> FileSketch {
         FileSketch {
@@ -35,10 +41,21 @@ mod tests {
 
     fn fixed_hashes() -> HashSet<u64> {
         [
-            0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+            0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597,
         ]
         .into_iter()
         .collect()
+    }
+
+    fn test_wymum(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        ((product >> 64) ^ product) as u64
+    }
+
+    fn direct_seek_wyrng(hash: u64, chunk: usize) -> u64 {
+        let chunk_offset = (chunk as u64).wrapping_add(1).wrapping_mul(WY_P0);
+        let state = hash.wrapping_add(chunk_offset);
+        test_wymum(state ^ WY_P1, state)
     }
 
     #[test]
@@ -58,19 +75,85 @@ mod tests {
     }
 
     #[test]
-    fn hd_encode_simd_matches_scalar_when_available() {
-        let sketch = sketch_for_hv(1024);
-        let hashes = fixed_hashes();
-        let scalar = hd::encode_hash_hd(&hashes, &sketch);
+    fn wyrng_direct_seek_matches_sequential_chunks() {
+        let hashes = [
+            0,
+            1,
+            0x1234_5678_9abc_def0,
+            u64::MAX,
+            0x8000_0000_0000_0000,
+            0xfedc_ba98_7654_3210,
+        ];
+        let chunks = [0, 1, 63, 64, 127, (1024 / 64) - 1, (4096 / 64) - 1];
 
-        if is_x86_feature_detected!("avx2") {
-            let avx2 = unsafe { hd::encode_hash_hd_avx2(&hashes, &sketch) };
-            assert_eq!(scalar, avx2);
+        for hash in hashes {
+            let max_chunk = chunks.iter().copied().max().unwrap();
+            let mut rng = WyRng::seed_from_u64(hash);
+            let sequential: Vec<u64> = (0..=max_chunk).map(|_| rng.next_u64()).collect();
+
+            for chunk in chunks {
+                assert_eq!(
+                    direct_seek_wyrng(hash, chunk),
+                    sequential[chunk],
+                    "direct seek mismatch for hash {hash:#018x}, chunk {chunk}"
+                );
+            }
         }
+    }
 
-        if is_x86_feature_detected!("avx512f") {
-            let avx512 = unsafe { hd::encode_hash_hd_avx512(&hashes, &sketch) };
-            assert_eq!(scalar, avx512);
+    #[test]
+    fn hd_encode_cpu_edge_cases_are_explicit() {
+        let empty_hashes = HashSet::new();
+        let empty_hv = hd::encode_hash_hd(&empty_hashes, &sketch_for_hv(128));
+        assert_eq!(empty_hv, vec![0; 128]);
+
+        let one_hash = HashSet::from([0x1234_5678_9abc_def0]);
+        let one_hash_hv = hd::encode_hash_hd(&one_hash, &sketch_for_hv(128));
+        assert_eq!(one_hash_hv.len(), 128);
+        assert!(one_hash_hv
+            .iter()
+            .all(|&coordinate| coordinate == -1 || coordinate == 1));
+
+        let zero_hash = HashSet::from([0]);
+        let zero_hash_hv = hd::encode_hash_hd(&zero_hash, &sketch_for_hv(64));
+        let zero_hash_bits = direct_seek_wyrng(0, 0);
+        let expected_zero_hash_hv: Vec<i32> = (0..64)
+            .map(|bit| -1 + (((zero_hash_bits >> bit) & 1) << 1) as i32)
+            .collect();
+        assert_eq!(zero_hash_hv, expected_zero_hash_hv);
+
+        let short_sketch = sketch_for_hv(70);
+        let short_hv = hd::encode_hash_hd(&one_hash, &short_sketch);
+        assert_eq!(short_hv.len(), 70);
+        assert!(short_hv[..64]
+            .iter()
+            .all(|&coordinate| coordinate == -1 || coordinate == 1));
+        assert_eq!(&short_hv[64..], &[-1; 6]);
+
+        let multi_hashes =
+            HashSet::from([0, 1, 0x1234_5678_9abc_def0, 0x8000_0000_0000_0000, u64::MAX]);
+        let multi_hash_short_hv = hd::encode_hash_hd(&multi_hashes, &short_sketch);
+        assert_eq!(multi_hash_short_hv.len(), 70);
+        assert_eq!(&multi_hash_short_hv[64..], &[-5; 6]);
+    }
+
+    #[test]
+    fn hd_encode_simd_matches_scalar_when_available() {
+        let hashes = fixed_hashes();
+
+        for hv_d in [70, 1024] {
+            let sketch = sketch_for_hv(hv_d);
+            let scalar = hd::encode_hash_hd(&hashes, &sketch);
+
+            if is_x86_feature_detected!("avx2") {
+                let avx2 = unsafe { hd::encode_hash_hd_avx2(&hashes, &sketch) };
+                assert_eq!(scalar, avx2);
+            }
+
+            if is_x86_feature_detected!("avx512f") {
+                let avx512 = unsafe { hd::encode_hash_hd_avx512(&hashes, &sketch) };
+                assert_eq!(scalar, avx512);
+            }
         }
     }
 
