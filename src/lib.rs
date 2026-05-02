@@ -21,7 +21,7 @@ mod tests {
     use rand::{RngCore, SeedableRng};
     use wyhash::WyRng;
 
-    use crate::types::FileSketch;
+    use crate::types::{FileSketch, FileSketchMetrics};
     use crate::{dist, hd, utils};
 
     #[cfg(feature = "cuda")]
@@ -204,6 +204,8 @@ mod tests {
     #[test]
     fn cuda_hd_encode_matches_cpu_edge_cases() {
         assert_cuda_hd_matches_cpu(&[], 1024);
+        assert_cuda_hd_matches_cpu(&[], 63);
+        assert_cuda_hd_matches_cpu(&[0x1234_5678_9abc_def0], 63);
         assert_cuda_hd_matches_cpu(&[0x1234_5678_9abc_def0], 1024);
         assert_cuda_hd_matches_cpu(&[0], 1024);
         assert_cuda_hd_matches_cpu(&[0], 4096);
@@ -226,6 +228,30 @@ mod tests {
         let larger: Vec<u64> = larger.into_iter().collect();
         assert_cuda_hd_matches_cpu(&larger, 1024);
         assert_cuda_hd_matches_cpu(&larger, 4096);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_hd_metrics_follow_gpu_work_applicability() {
+        use crate::hd_cuda;
+
+        let (ctx, module) = cuda_hd_test_module();
+
+        let (_empty_hv, empty_metrics) =
+            hd_cuda::encode_hash_hd_cuda(&[], 4096, &ctx, &module).unwrap();
+        assert_eq!(empty_metrics, hd_cuda::GpuHdEncodeMetrics::default());
+
+        let (_short_hv, short_metrics) =
+            hd_cuda::encode_hash_hd_cuda(&[0x1234_5678_9abc_def0], 63, &ctx, &module).unwrap();
+        assert_eq!(short_metrics, hd_cuda::GpuHdEncodeMetrics::default());
+
+        let (_normal_hv, normal_metrics) =
+            hd_cuda::encode_hash_hd_cuda(&[0x1234_5678_9abc_def0], 4096, &ctx, &module).unwrap();
+        assert!(normal_metrics.cuda_hd_alloc_ns > 0);
+        assert!(normal_metrics.cuda_hd_hash_h2d_ns > 0);
+        assert!(normal_metrics.cuda_hd_hv_h2d_ns > 0);
+        assert!(normal_metrics.cuda_hd_kernel_launch_ns > 0);
+        assert!(normal_metrics.cuda_hd_d2h_ns > 0);
     }
 
     #[test]
@@ -333,6 +359,81 @@ mod tests {
         assert_eq!(names.len(), 15);
         assert!(names.contains(&String::from("sample.fna")));
         assert!(names.contains(&String::from("sample.fasta.zst")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sketch_metrics_tsv_preserves_cuda_hd_na_contract() {
+        let dir = unique_test_dir("dotani_metrics_schema");
+        fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("metrics");
+
+        let cpu_metric = FileSketchMetrics {
+            file: String::from("cpu.fna"),
+            input_bases: 32,
+            hashes_seen: 28,
+            unique_hashes: 2,
+            ..FileSketchMetrics::default()
+        };
+        let cuda_metric = FileSketchMetrics {
+            file: String::from("cuda.fna"),
+            input_bases: 32,
+            hashes_seen: 28,
+            unique_hashes: 2,
+            cuda_stream_lane: Some(0),
+            cuda_h2d_ns: Some(11),
+            cuda_alloc_ns: Some(22),
+            cuda_launch_ns: Some(33),
+            cuda_d2h_ns: Some(44),
+            cuda_zero_filter_ns: Some(55),
+            cuda_filter_ns: Some(66),
+            ..FileSketchMetrics::default()
+        };
+
+        utils::dump_sketch_metrics(&[cpu_metric, cuda_metric], &prefix, 1234);
+
+        let files_path = dir.join("metrics.files.tsv");
+        let files_tsv = fs::read_to_string(&files_path).unwrap();
+        let rows: Vec<Vec<&str>> = files_tsv
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+
+        assert_eq!(rows.len(), 3);
+        let header = &rows[0];
+        assert_eq!(header.len(), 23);
+        assert_eq!(
+            &header[18..],
+            &[
+                "cuda_hd_hash_h2d_ns",
+                "cuda_hd_hv_h2d_ns",
+                "cuda_hd_alloc_ns",
+                "cuda_hd_kernel_launch_ns",
+                "cuda_hd_d2h_ns"
+            ]
+        );
+
+        let cpu_row = &rows[1];
+        let cuda_row = &rows[2];
+        assert_eq!(cpu_row.len(), header.len());
+        assert_eq!(cuda_row.len(), header.len());
+        assert_eq!(cpu_row[0], "cpu.fna");
+        assert_eq!(&cpu_row[11..], &["NA"; 12]);
+        assert_eq!(cuda_row[0], "cuda.fna");
+        assert_eq!(&cuda_row[12..18], &["11", "22", "33", "44", "55", "66"]);
+        assert_eq!(&cuda_row[18..], &["NA"; 5]);
+
+        let summary_tsv = fs::read_to_string(dir.join("metrics.summary.tsv")).unwrap();
+        let summary_rows: Vec<Vec<&str>> = summary_tsv
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert_eq!(summary_rows.len(), 2);
+        assert_eq!(summary_rows[0].len(), 23);
+        assert_eq!(summary_rows[1].len(), 23);
+        assert_eq!(summary_rows[1][0], "TOTAL");
+        assert_eq!(&summary_rows[1][18..], &["NA"; 5]);
 
         fs::remove_dir_all(&dir).unwrap();
     }

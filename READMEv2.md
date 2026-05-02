@@ -79,7 +79,8 @@ Metrics:
 Current CUDA path is still limited by CPU pipeline, more specifically post hashing work, 
 and not as much decompression as originally thought
 
-On `GCA/946` (~1000 genomes) run with `-T 16 -d 4096`:
+On `GCA/946` (~1000 genomes) 
+run with `-T 16 -d 4096`:
 
 - `sketch_wall_s`: `230.671`
 - `fasta_s`: `21.365`

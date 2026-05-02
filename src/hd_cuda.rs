@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use cudarc::driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg};
 
 const HASH_TILE: usize = 256;

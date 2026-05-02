@@ -50,15 +50,13 @@ pub fn dist(sketch_dist: &mut SketchDist) {
 
     for i in 0..ref_file_sketch.len() {
         assert_eq!(
-            ref_file_sketch[i].file_str,
-            ref_ull_sketch[i].file_str,
+            ref_file_sketch[i].file_str, ref_ull_sketch[i].file_str,
             "Ref HD/ULL file order mismatch"
         );
     }
     for i in 0..query_file_sketch.len() {
         assert_eq!(
-            query_file_sketch[i].file_str,
-            query_ull_sketch[i].file_str,
+            query_file_sketch[i].file_str, query_ull_sketch[i].file_str,
             "Query HD/ULL file order mismatch"
         );
     }

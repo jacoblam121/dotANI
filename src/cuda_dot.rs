@@ -336,7 +336,11 @@ impl GpuDotExecutor {
             );
         }
         if out.len() != nq * nr {
-            bail!("out length mismatch: got {}, expected {}", out.len(), nq * nr);
+            bail!(
+                "out length mismatch: got {}, expected {}",
+                out.len(),
+                nq * nr
+            );
         }
         if d == 0 {
             bail!("d must be > 0");
@@ -386,11 +390,7 @@ impl GpuDotExecutor {
         let smem_bytes = shared_mem_bytes_i32(BLOCK_M, BLOCK_N, BLOCK_K);
 
         let cfg = LaunchConfig {
-            grid_dim: (
-                nr.div_ceil(BLOCK_N) as u32,
-                nq.div_ceil(BLOCK_M) as u32,
-                1,
-            ),
+            grid_dim: (nr.div_ceil(BLOCK_N) as u32, nq.div_ceil(BLOCK_M) as u32, 1),
             block_dim: (BLK_X as u32, BLK_Y as u32, 1),
             shared_mem_bytes: smem_bytes,
         };

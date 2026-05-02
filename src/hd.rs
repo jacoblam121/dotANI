@@ -54,7 +54,12 @@ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSke
 
     seed_vec.resize(num_seed_round_4, 0);
 
-    let mut rng_vec = [WyRng::default(), WyRng::default(), WyRng::default(), WyRng::default()];
+    let mut rng_vec = [
+        WyRng::default(),
+        WyRng::default(),
+        WyRng::default(),
+        WyRng::default(),
+    ];
     let mut rnd_vec = [0u64; 4];
 
     for b_i in 0..num_batch_round_4 {
@@ -98,10 +103,7 @@ pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSke
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-pub unsafe fn encode_hash_hd_avx512(
-    kmer_hash_set: &HashSet<u64>,
-    sketch: &FileSketch,
-) -> Vec<i32> {
+pub unsafe fn encode_hash_hd_avx512(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i32> {
     let hv_d = sketch.hv_d;
     let num_seed = kmer_hash_set.len();
 
