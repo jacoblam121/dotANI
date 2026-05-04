@@ -64,12 +64,14 @@ In ns by default, `sketch_wall_ns` is wall clock (end to end time)
 ## Findings
 
 Local machine: Ryzen 9 8945HS, 32GB DDR5, RTX 4070 mobile
+
 Lab server (Russell): Ryzen Threadripper 9985WX, 768GB DDR5, RTX PRO 6000 (only used 1x GPU)
 
 GPU now hashes kmers and does HD encoding, for about a ~5x speedup
 
 On original subset `GCA/946`
 (~1120 genomes) with `-T 16 -d 4096`:
+
 *Cuda HD metrics unavailable as were not yet implemented
 
 - `sketch_wall_s`: `230.671`
@@ -110,6 +112,7 @@ After moving HD encoding to GPU (3 run median):
 - `cuda_hd_d2h_s`: `16.023`
 
 HD encode worker time dropped from `3331.676s` to `39.985s`, ~83x faster.
+
 Wall clock time dropped from `230.671s` to `44.666`, ~5.2x faster. 
 
 ### Testing at scale (full GTDB database):
@@ -153,10 +156,14 @@ Russell:
 - `cuda_hd_d2h_s`: `3515.591`
 
 Local finished in `5711.572s` or ~95 minutes, previous ETA was ~8 hours, which checks out for a ~5.05x speedup
+
 Russell finished in `1347.999s` or ~22.5 minutes, previous ETA was ~110 minutes (if I remember correctly), but would be a ~4.89x speedup
 
 Interestingly, on local machine CPU was constantly hammered at full CPU util, while GPU util fluctuated from around 50-80%. Memory was maxed out as well. 
-However, on Russell, neither CPU or GPU was fully being utilized. Load average was ~15 even though running with -T 128. GPU util mirrored local, fluctuating from 50-80% util. Not sure what the bottleneck is here, entire dataset was loaded into ram so we can rule out the hdd being the bottleneck. 
+
+However, on Russell, neither CPU or GPU was fully being utilized. Load average was ~15 even though running with -T 128. GPU util mirrored local, fluctuating from 50-80% util. 
+
+Not sure what the bottleneck is here, entire dataset was loaded into ram so we can rule out the hdd being the bottleneck. 
 
 ## Current Update:
 
