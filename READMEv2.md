@@ -74,42 +74,46 @@ On original subset `GCA/946`
 
 *Cuda HD metrics unavailable as were not yet implemented
 
-- `sketch_wall_s`: `230.671`
-- `fasta_s`: `21.365`
-- `hash_dedup_s`: `266.229`
-- `hd_encode_s`: `3331.676`
-- `hd_compress_s`: `0.025`
-- `cuda_h2d_s`: `2.404`
-- `cuda_alloc_s`: `5.007`
-- `cuda_launch_s`: `0.387`
-- `cuda_d2h_s`: `27.944`
-- `cuda_zero_filter_s`: `2.911`
-- `cuda_filter_s`: `266.229`
-- `cuda_hd_hash_h2d_s`: `NA`
-- `cuda_hd_hv_h2d_s`: `NA`
-- `cuda_hd_alloc_s`: `NA`
-- `cuda_hd_launch_s`: `NA`
-- `cuda_hd_d2h_s`: `NA`
+| Metric | Seconds |
+|---|---|
+| `sketch_wall_s` | 230.671 |
+| `fasta_s` | 21.365 |
+| `hash_dedup_s` | 266.229 |
+| `hd_encode_s` | 3331.676 |
+| `hd_compress_s` | 0.025 |
+| `cuda_h2d_s` | 2.404 |
+| `cuda_alloc_s` | 5.007 |
+| `cuda_launch_s` | 0.387 |
+| `cuda_d2h_s` | 27.944 |
+| `cuda_zero_filter_s` | 2.911 |
+| `cuda_filter_s` | 266.229 |
+| `cuda_hd_hash_h2d_s` | NA |
+| `cuda_hd_hv_h2d_s` | NA |
+| `cuda_hd_alloc_s` | NA |
+| `cuda_hd_launch_s` | NA |
+| `cuda_hd_d2h_s` | NA |
 
 
 After moving HD encoding to GPU (3 run median): 
 
-- `sketch_wall_s`: `44.666`
-- `fasta_s`: `18.858`
-- `hash_dedup_s`: `592.706`
-- `hd_encode_s`: `39.985`
-- `hd_compress_s`: `0.026`
-- `cuda_h2d_s`: `3.060`
-- `cuda_alloc_s`: `11.016`
-- `cuda_launch_s`: `1.167`
-- `cuda_d2h_s`: `10.012`
-- `cuda_zero_filter_s`: `2.706`
-- `cuda_filter_s`: `592.706`
-- `cuda_hd_hash_h2d_s`: `5.389`
-- `cuda_hd_hv_h2d_s`: `1.613`
-- `cuda_hd_alloc_s`: `9.887`
-- `cuda_hd_launch_s`: `0.986`
-- `cuda_hd_d2h_s`: `16.023`
+| Metric | Seconds |
+|---|---|
+| `sketch_wall_s` | 44.666 |
+| `fasta_s` | 18.858 |
+| `hash_dedup_s` | 592.706 |
+| `hd_encode_s` | 39.985 |
+| `hd_compress_s` | 0.026 |
+| `cuda_h2d_s` | 3.060 |
+| `cuda_alloc_s` | 11.016 |
+| `cuda_launch_s` | 1.167 |
+| `cuda_d2h_s` | 10.012 |
+| `cuda_zero_filter_s` | 2.706 |
+| `cuda_filter_s` | 592.706 |
+| `cuda_hd_hash_h2d_s` | 5.389 |
+| `cuda_hd_hv_h2d_s` | 1.613 |
+| `cuda_hd_alloc_s` | 9.887 |
+| `cuda_hd_launch_s` | 0.986 |
+| `cuda_hd_d2h_s` | 16.023 |
 
 HD encode worker time dropped from `3331.676s` to `39.985s`, ~83x faster.
 
@@ -119,41 +123,45 @@ Wall clock time dropped from `230.671s` to `44.666`, ~5.2x faster.
 
 Local: 
 
-- `sketch_wall_s`: `5711.572`
-- `fasta_s`: `2476.974`
-- `hash_dedup_s`: `79545.811`
-- `hd_encode_s`: `4101.001`
-- `hd_compress_s`: `2.284`
-- `cuda_h2d_s`: `281.053`
-- `cuda_alloc_s`: `946.676`
-- `cuda_launch_s`: `101.854`
-- `cuda_d2h_s`: `950.724`
-- `cuda_zero_filter_s`: `348.173`
-- `cuda_filter_s`: `79545.811`
-- `cuda_hd_hash_h2d_s`: `593.772`
-- `cuda_hd_hv_h2d_s`: `148.233`
-- `cuda_hd_alloc_s`: `858.284`
-- `cuda_hd_launch_s`: `83.699`
-- `cuda_hd_d2h_s`: `1893.399`
+| Metric | Seconds |
+|---|---|
+| `sketch_wall_s` | 5711.572 |
+| `fasta_s` | 2476.974 |
+| `hash_dedup_s` | 79545.811 |
+| `hd_encode_s` | 4101.001 |
+| `hd_compress_s` | 2.284 |
+| `cuda_h2d_s` | 281.053 |
+| `cuda_alloc_s` | 946.676 |
+| `cuda_launch_s` | 101.854 |
+| `cuda_d2h_s` | 950.724 |
+| `cuda_zero_filter_s` | 348.173 |
+| `cuda_filter_s` | 79545.811 |
+| `cuda_hd_hash_h2d_s` | 593.772 |
+| `cuda_hd_hv_h2d_s` | 148.233 |
+| `cuda_hd_alloc_s` | 858.284 |
+| `cuda_hd_launch_s` | 83.699 |
+| `cuda_hd_d2h_s` | 1893.399 |
 
 Russell:
 
-- `sketch_wall_s`: `1347.999`
-- `fasta_s`: `1152.078`
-- `hash_dedup_s`: `21402.781`
-- `hd_encode_s`: `66854.554`
-- `hd_compress_s`: `1.141`
-- `cuda_h2d_s`: `12062.720`
-- `cuda_alloc_s`: `22211.992`
-- `cuda_launch_s`: `1683.784`
-- `cuda_d2h_s`: `8131.035`
-- `cuda_zero_filter_s`: `179.630`
-- `cuda_filter_s`: `21402.781`
-- `cuda_hd_hash_h2d_s`: `12941.544`
-- `cuda_hd_hv_h2d_s`: `2661.834`
-- `cuda_hd_alloc_s`: `22478.886`
-- `cuda_hd_launch_s`: `3283.399`
-- `cuda_hd_d2h_s`: `3515.591`
+| Metric | Seconds |
+|---|---|
+| `sketch_wall_s` | 1347.999 |
+| `fasta_s` | 1152.078 |
+| `hash_dedup_s` | 21402.781 |
+| `hd_encode_s` | 66854.554 |
+| `hd_compress_s` | 1.141 |
+| `cuda_h2d_s` | 12062.720 |
+| `cuda_alloc_s` | 22211.992 |
+| `cuda_launch_s` | 1683.784 |
+| `cuda_d2h_s` | 8131.035 |
+| `cuda_zero_filter_s` | 179.630 |
+| `cuda_filter_s` | 21402.781 |
+| `cuda_hd_hash_h2d_s` | 12941.544 |
+| `cuda_hd_hv_h2d_s` | 2661.834 |
+| `cuda_hd_alloc_s` | 22478.886 |
+| `cuda_hd_launch_s` | 3283.399 |
+| `cuda_hd_d2h_s` | 3515.591 |
 
 Local finished in `5711.572s` or ~95 minutes, previous ETA was ~8 hours, which checks out for a ~5.05x speedup
 
@@ -181,8 +189,8 @@ Not sure what the bottleneck is here, entire dataset was loaded into ram so we c
 
 ## HyperSpec
 
-Implementation inspired by HyperSpec's GPU method, but not a direct port. 
-HyperSpec's mass spectra clustering has different inputs, HD vector representation, distance math, and file output format. 
+Drew from HyperSpec's GPU method, but not a direct port as they are incompatible. 
+(HyperSpec's mass spectra clustering has different inputs, HD vector representation, distance math, and file output format.)
 
 
 # (Everything below this line generated by AI)
