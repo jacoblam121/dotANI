@@ -2,9 +2,9 @@
 
 ## High Level
 - WyRng is standard and already used by CPU encoder
-- GPU HD encoding was previously implemented in HyperSpec and is not new
+- GPU HD encoding itsellf was previously implemented in HyperSpec and is not new
 - Existing HD encoder in dotANI was moved onto the GPU while preserving existing behavior, distance path, and .sketch/.ull format
-- GPU HD encode is able to be done by directly reproducing the same pseudorandom WyRng word that the CPU would produce for each `(hash, 64-coordinate chunk)`. This lets independent CUDA threads compute coordinates without going through a serial WyRng stream. 
+- GPU HD encode is able to be done by reproducing the same pseudorandom WyRng word that the CPU would output for each `(hash, 64-coordinate chunk)` without actually calling the Rust WyRng function (reimplement WyRng on GPU). This lets independent CUDA threads compute chunk contributions without going through a serial WyRng stream. 
 
 ## dotANI pipeline
 
