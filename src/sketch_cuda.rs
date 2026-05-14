@@ -428,6 +428,7 @@ fn sketch_one_file_cuda(
 
     let hash_and_dedup_start = Instant::now();
     scratch.sampled_hashes.clear();
+    let mut restore_full_hashes_after_hd = false;
     let ull_record = match params.cuda_dedup_strategy {
         CudaDedupStrategy::HashSet => {
             scratch.sampled_hash_set.clear();
@@ -471,7 +472,6 @@ fn sketch_one_file_cuda(
                     ull.add(h);
                 }
 
-                scratch.sampled_hashes.extend(&scratch.full_hashes);
                 Some(FileUllSketch {
                     ksize: params.ksize,
                     canonical: params.canonical,
@@ -490,8 +490,15 @@ fn sketch_one_file_cuda(
                 );
                 None
             };
-            scratch.sampled_hashes.sort_unstable();
-            scratch.sampled_hashes.dedup();
+            if params.if_ull {
+                scratch.full_hashes.sort_unstable();
+                scratch.full_hashes.dedup();
+                std::mem::swap(&mut scratch.sampled_hashes, &mut scratch.full_hashes);
+                restore_full_hashes_after_hd = true;
+            } else {
+                scratch.sampled_hashes.sort_unstable();
+                scratch.sampled_hashes.dedup();
+            }
 
             ull_record
         }
@@ -525,6 +532,10 @@ fn sketch_one_file_cuda(
     }
     metrics.hd_compress_ns = start.elapsed().as_nanos();
     metrics.total_worker_ns = worker_start.elapsed().as_nanos();
+
+    if restore_full_hashes_after_hd {
+        std::mem::swap(&mut scratch.sampled_hashes, &mut scratch.full_hashes);
+    }
 
     Ok(IndexedSketchResult {
         index,
