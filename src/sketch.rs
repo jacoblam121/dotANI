@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use needletail::{parse_fastx_file, Sequence};
+use needletail::{Sequence, parse_fastx_file};
 use rayon::prelude::*;
 
 use crate::types::*;

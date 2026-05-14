@@ -321,11 +321,14 @@ extern "C" __device__ uint64_t t1ha2_atonce(uint8_t *data, size_t length,
 extern "C" __global__ void
 cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
                 const size_t n_kmer_per_thread, const size_t n_hash_per_thread,
-                const size_t ksize, const uint64_t threshold,
+                const size_t n_threads, const size_t ksize, const uint64_t threshold,
                 const uint64_t seed, const bool canonical,
-                uint64_t *kmer_scaled_hash) {
+                uint64_t *kmer_scaled_hash, uint32_t *kmer_hash_counts) {
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_threads) {
+    return;
+  }
 
   // Each thread only processes n_kmer_thread kmers
   // BPs that each thread accesses
@@ -384,9 +387,11 @@ cuda_kmer_t1ha2(uint8_t *seq, const size_t n_bps,
           kmer_hash = t1ha2_atonce(ptr_fwd, ksize, seed);
         }
 
-        if (cnt_hash < n_hash_per_thread && kmer_hash < threshold)
+        if (cnt_hash < n_hash_per_thread && kmer_hash != 0 && kmer_hash < threshold)
           kmer_scaled_hash[tid * n_hash_per_thread + (cnt_hash++)] = kmer_hash;
       }
     }
   }
+
+  kmer_hash_counts[tid] = cnt_hash;
 }
