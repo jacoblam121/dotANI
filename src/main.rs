@@ -132,6 +132,14 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("cuda_dedup")
+                .long("cuda-dedup")
+                .help("CUDA host-side dedup strategy")
+                .default_value("hashset")
+                .value_parser(["hashset", "sort_unstable"])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("metrics_out")
                 .long("metrics-out")
                 .help("Write sketch metrics to <prefix>.summary.tsv and <prefix>.files.tsv")
@@ -267,6 +275,9 @@ fn main() {
             ani_threshold: 0.0,
             if_compressed: true,
             threads,
+            cuda_dedup_strategy: types::CudaDedupStrategy::from_cli_value(
+                sketch_m.get_one::<String>("cuda_dedup").unwrap(),
+            ),
             device,
             if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -276,17 +287,17 @@ fn main() {
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
         };
 
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(cli_params.threads as usize)
-            .build_global()
-            .unwrap();
-
         let sketch_params = types::SketchParams::new(&cli_params);
 
         if sketch_params.device == "cuda" {
             #[cfg(feature = "cuda")]
             sketch_cuda::sketch_cuda(sketch_params);
         } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(cli_params.threads as usize)
+                .build_global()
+                .unwrap();
+
             sketch::sketch(sketch_params);
         }
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
@@ -314,6 +325,7 @@ fn main() {
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads,
+            cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,
@@ -355,6 +367,7 @@ fn main() {
             ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads,
+            cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,

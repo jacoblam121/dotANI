@@ -77,6 +77,7 @@ pub struct CliParams {
     pub if_compressed: bool,
 
     pub threads: u8,
+    pub cuda_dedup_strategy: CudaDedupStrategy,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -85,6 +86,29 @@ pub struct CliParams {
     pub path_query_ull: PathBuf,
 
     pub metrics_out: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaDedupStrategy {
+    HashSet,
+    SortUnstable,
+}
+
+impl CudaDedupStrategy {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "hashset" => Self::HashSet,
+            "sort_unstable" => Self::SortUnstable,
+            _ => panic!("Invalid CUDA dedup strategy: {value}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HashSet => "hashset",
+            Self::SortUnstable => "sort_unstable",
+        }
+    }
 }
 
 pub struct SketchParams {
@@ -99,6 +123,8 @@ pub struct SketchParams {
     pub hv_d: usize,
     pub hv_quant_scale: f32,
     pub if_compressed: bool,
+    pub threads: u8,
+    pub cuda_dedup_strategy: CudaDedupStrategy,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -120,6 +146,8 @@ impl Default for SketchParams {
             hv_d: 4096,
             hv_quant_scale: 1.0,
             if_compressed: true,
+            threads: 1,
+            cuda_dedup_strategy: CudaDedupStrategy::HashSet,
 
             if_ull: false,
             ull_p: 14,
@@ -143,6 +171,8 @@ impl SketchParams {
         new_sketch.hv_d = params.hv_d;
         new_sketch.hv_quant_scale = params.hv_quant_scale;
         new_sketch.if_compressed = params.if_compressed;
+        new_sketch.threads = params.threads;
+        new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
 
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;
@@ -167,6 +197,7 @@ pub struct FileSketchMetrics {
     pub total_worker_ns: u128,
     pub sketch_wall_ns: Option<u128>,
     pub cuda_stream_lane: Option<usize>,
+    pub cuda_device_id: Option<usize>,
     pub cuda_h2d_ns: Option<u128>,
     pub cuda_alloc_ns: Option<u128>,
     pub cuda_launch_ns: Option<u128>,

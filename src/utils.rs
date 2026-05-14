@@ -199,12 +199,12 @@ fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
 }
 
 fn metrics_header() -> &'static str {
-    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
+    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
 }
 
 fn metric_row(metric: &FileSketchMetrics) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         metric.file,
         metric.input_bases,
         metric.hashes_seen,
@@ -217,6 +217,7 @@ fn metric_row(metric: &FileSketchMetrics) -> String {
         metric.total_worker_ns,
         optional_ns(metric.sketch_wall_ns),
         optional_usize(metric.cuda_stream_lane),
+        optional_usize(metric.cuda_device_id),
         optional_ns(metric.cuda_h2d_ns),
         optional_ns(metric.cuda_alloc_ns),
         optional_ns(metric.cuda_launch_ns),
