@@ -10,14 +10,14 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
-use crate::cuda_dot::{GpuDotExecutor, device_count};
+use crate::cuda_dot::{device_count, GpuDotExecutor};
 
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();

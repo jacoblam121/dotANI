@@ -64,11 +64,9 @@ struct CudaSketchLaneScratch {
     sampled_hashes: Vec<u64>,
     sampled_hash_set: HashSet<u64>,
     host_kmer_hash: Vec<u64>,
-    host_kmer_counts: Vec<u32>,
     hv_host: Vec<i32>,
     d_seq: Option<CudaSlice<u8>>,
     d_kmer_hash: Option<CudaSlice<u64>>,
-    d_kmer_counts: Option<CudaSlice<u32>>,
     d_hd_hashes: Option<CudaSlice<u64>>,
     d_hv: Option<CudaSlice<i32>>,
 }
@@ -94,11 +92,9 @@ impl CudaSketchLaneScratch {
             sampled_hashes: Vec::new(),
             sampled_hash_set: HashSet::new(),
             host_kmer_hash: Vec::new(),
-            host_kmer_counts: Vec::new(),
             hv_host: Vec::new(),
             d_seq: None,
             d_kmer_hash: None,
-            d_kmer_counts: None,
             d_hd_hashes: None,
             d_hv: None,
         })
@@ -119,18 +115,6 @@ impl CudaSketchLaneScratch {
             let capacity =
                 grow_capacity(self.d_kmer_hash.as_ref().map_or(0, |buf| buf.len()), needed);
             self.d_kmer_hash = Some(unsafe { self.stream.alloc::<u64>(capacity)? });
-        }
-        Ok(start.elapsed().as_nanos())
-    }
-
-    fn ensure_kmer_count_capacity(&mut self, needed: usize) -> Result<u128> {
-        let start = Instant::now();
-        if self.d_kmer_counts.as_ref().map_or(0, |buf| buf.len()) < needed {
-            let capacity = grow_capacity(
-                self.d_kmer_counts.as_ref().map_or(0, |buf| buf.len()),
-                needed,
-            );
-            self.d_kmer_counts = Some(unsafe { self.stream.alloc::<u32>(capacity)? });
         }
         Ok(start.elapsed().as_nanos())
     }
@@ -169,41 +153,6 @@ fn grow_capacity(current: usize, needed: usize) -> usize {
         }
     }
     capacity
-}
-
-#[cfg(feature = "cuda")]
-fn materialize_counted_kmer_hashes(
-    host_kmer_hash: &[u64],
-    host_kmer_counts: &[u32],
-    n_hash_per_thread: usize,
-    full_hashes: &mut Vec<u64>,
-) -> Result<()> {
-    full_hashes.clear();
-    for (tid, &count) in host_kmer_counts.iter().enumerate() {
-        let count = count as usize;
-        if count > n_hash_per_thread {
-            return Err(anyhow!(
-                "CUDA k-mer count {} exceeds per-thread capacity {} for thread {}",
-                count,
-                n_hash_per_thread,
-                tid
-            ));
-        }
-
-        let base = tid * n_hash_per_thread;
-        let end = base + count;
-        if end > host_kmer_hash.len() {
-            return Err(anyhow!(
-                "CUDA k-mer count range {}..{} exceeds host hash buffer length {}",
-                base,
-                end,
-                host_kmer_hash.len()
-            ));
-        }
-        full_hashes.extend_from_slice(&host_kmer_hash[base..end]);
-    }
-
-    Ok(())
 }
 
 #[allow(unused_variables)]
@@ -632,8 +581,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
     let n_hash_array = n_hash_per_thread * n_threads;
     let seq_alloc_ns = scratch.ensure_seq_capacity(n_bps)?;
     let hash_alloc_ns = scratch.ensure_kmer_hash_capacity(n_hash_array)?;
-    let count_alloc_ns = scratch.ensure_kmer_count_capacity(n_threads)?;
-    metrics.cuda_alloc_ns = Some(seq_alloc_ns + hash_alloc_ns + count_alloc_ns);
+    metrics.cuda_alloc_ns = Some(seq_alloc_ns + hash_alloc_ns);
 
     let gpu_seq = scratch
         .d_seq
@@ -643,10 +591,6 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
         .d_kmer_hash
         .as_mut()
         .expect("k-mer hash device buffer should be allocated");
-    let gpu_kmer_counts = scratch
-        .d_kmer_counts
-        .as_mut()
-        .expect("k-mer count device buffer should be allocated");
 
     let h2d_start = Instant::now();
     scratch
@@ -654,12 +598,18 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
         .memcpy_htod(&fna_seqs, &mut gpu_seq.slice_mut(0..n_bps))?;
     metrics.cuda_h2d_ns = Some(h2d_start.elapsed().as_nanos());
 
+    let zero_start = Instant::now();
+    scratch
+        .stream
+        .memset_zeros(&mut gpu_kmer_hash.slice_mut(0..n_hash_array))?;
+    let zero_ns = zero_start.elapsed().as_nanos();
+    metrics.cuda_alloc_ns = Some(metrics.cuda_alloc_ns.unwrap_or(0) + zero_ns);
+
     let mut builder = scratch.stream.launch_builder(&scratch.kmer_fn);
     builder.arg(&*gpu_seq);
     builder.arg(&n_bps);
     builder.arg(&kmer_per_thread);
     builder.arg(&n_hash_per_thread);
-    builder.arg(&n_threads);
     builder.arg(&ksize);
 
     let full_threshold = u64::MAX;
@@ -668,7 +618,6 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
     builder.arg(&seed);
     builder.arg(&canonical);
     builder.arg(&mut *gpu_kmer_hash);
-    builder.arg(&mut *gpu_kmer_counts);
 
     let launch_start = Instant::now();
     unsafe {
@@ -677,25 +626,20 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
     metrics.cuda_launch_ns = Some(launch_start.elapsed().as_nanos());
 
     scratch.host_kmer_hash.resize(n_hash_array, 0);
-    scratch.host_kmer_counts.resize(n_threads, 0);
     let d2h_start = Instant::now();
     scratch.stream.memcpy_dtoh(
         &gpu_kmer_hash.slice(0..n_hash_array),
         &mut scratch.host_kmer_hash[..n_hash_array],
     )?;
-    scratch.stream.memcpy_dtoh(
-        &gpu_kmer_counts.slice(0..n_threads),
-        &mut scratch.host_kmer_counts[..n_threads],
-    )?;
     metrics.cuda_d2h_ns = Some(d2h_start.elapsed().as_nanos());
 
     let filter_start = Instant::now();
-    materialize_counted_kmer_hashes(
-        &scratch.host_kmer_hash[..n_hash_array],
-        &scratch.host_kmer_counts[..n_threads],
-        n_hash_per_thread,
-        &mut scratch.full_hashes,
-    )?;
+    scratch.full_hashes.extend(
+        scratch.host_kmer_hash[..n_hash_array]
+            .iter()
+            .copied()
+            .filter(|&h| h != 0),
+    );
     metrics.cuda_zero_filter_ns = Some(filter_start.elapsed().as_nanos());
 
     Ok(metrics)
@@ -849,138 +793,6 @@ mod tests {
 
         assert!(err.to_string().contains("duplicate file index 0"));
     }
-
-    #[test]
-    fn cuda_kmer_t1ha2_counts_ignore_stale_hash_slots() {
-        let ctx = CudaContext::new(0).unwrap();
-        let module = ctx
-            .load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))
-            .unwrap();
-        let stream = ctx.default_stream();
-        let kmer_fn = module.load_function("cuda_kmer_t1ha2").unwrap();
-
-        let mut seq = Vec::with_capacity(620);
-        for i in 0..620 {
-            seq.push(match i % 4 {
-                0 => b'A',
-                1 => b'c',
-                2 => b'G',
-                _ => b't',
-            });
-        }
-        seq[17] = b'N';
-        seq[518] = b'n';
-        seq[540] = b'X';
-
-        let ksize = 5usize;
-        let seed = 123u64;
-        let canonical = true;
-        let n_bps = seq.len();
-        let n_kmers = n_bps - ksize + 1;
-        let kmer_per_thread = 512usize;
-        let n_threads = n_kmers.div_ceil(kmer_per_thread);
-        let n_hash_per_thread = kmer_per_thread;
-        let n_hash_array = n_hash_per_thread * n_threads;
-
-        let stale_hash = 0xdead_beef_dead_beefu64;
-        let expected = expected_t1ha2_hashes(&seq, ksize, seed, canonical);
-        assert!(!expected.contains(&stale_hash));
-
-        let mut gpu_seq = stream.clone_htod(&seq).unwrap();
-        let mut gpu_kmer_hash = unsafe { stream.alloc::<u64>(n_hash_array).unwrap() };
-        let mut gpu_kmer_counts = unsafe { stream.alloc::<u32>(n_threads).unwrap() };
-        let stale_hashes = vec![stale_hash; n_hash_array];
-        stream
-            .memcpy_htod(&stale_hashes, &mut gpu_kmer_hash.slice_mut(0..n_hash_array))
-            .unwrap();
-
-        let mut builder = stream.launch_builder(&kmer_fn);
-        builder.arg(&mut gpu_seq);
-        builder.arg(&n_bps);
-        builder.arg(&kmer_per_thread);
-        builder.arg(&n_hash_per_thread);
-        builder.arg(&n_threads);
-        builder.arg(&ksize);
-
-        let full_threshold = u64::MAX;
-        builder.arg(&full_threshold);
-
-        builder.arg(&seed);
-        builder.arg(&canonical);
-        builder.arg(&mut gpu_kmer_hash);
-        builder.arg(&mut gpu_kmer_counts);
-
-        unsafe {
-            builder
-                .launch(LaunchConfig::for_num_elems(n_threads as u32))
-                .unwrap();
-        }
-
-        let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
-        let host_kmer_counts = stream.clone_dtoh(&gpu_kmer_counts).unwrap();
-        let mut actual = Vec::new();
-        materialize_counted_kmer_hashes(
-            &host_kmer_hash,
-            &host_kmer_counts,
-            n_hash_per_thread,
-            &mut actual,
-        )
-        .unwrap();
-
-        assert_eq!(actual, expected);
-        assert!(!actual.contains(&stale_hash));
-    }
-
-    fn expected_t1ha2_hashes(seq: &[u8], ksize: usize, seed: u64, canonical: bool) -> Vec<u64> {
-        let mut hashes = Vec::new();
-        for window in seq.windows(ksize) {
-            let Some(fwd) = normalize_kmer(window) else {
-                continue;
-            };
-            let kmer_hash = if canonical {
-                let rev = reverse_complement(&fwd);
-                if fwd.as_slice() > rev.as_slice() {
-                    t1ha::t1ha2_atonce(&rev, seed)
-                } else {
-                    t1ha::t1ha2_atonce(&fwd, seed)
-                }
-            } else {
-                t1ha::t1ha2_atonce(&fwd, seed)
-            };
-
-            if kmer_hash != 0 {
-                hashes.push(kmer_hash);
-            }
-        }
-        hashes
-    }
-
-    fn normalize_kmer(kmer: &[u8]) -> Option<Vec<u8>> {
-        let mut normalized = Vec::with_capacity(kmer.len());
-        for &base in kmer {
-            normalized.push(match base {
-                b'A' | b'a' => b'A',
-                b'C' | b'c' => b'C',
-                b'G' | b'g' => b'G',
-                b'T' | b't' => b'T',
-                _ => return None,
-            });
-        }
-        Some(normalized)
-    }
-
-    fn reverse_complement(kmer: &[u8]) -> Vec<u8> {
-        kmer.iter()
-            .rev()
-            .map(|base| match base {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                _ => unreachable!("k-mer should already be normalized"),
-            })
-            .collect()
-    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1102,8 +914,7 @@ pub fn cuda_t1ha2_hash_parallel(
 
             let n_hash_per_thread = kmer_per_thread;
             let n_hash_array = n_hash_per_thread * n_threads;
-            let mut gpu_kmer_hash = unsafe { stream.alloc::<u64>(n_hash_array).unwrap() };
-            let mut gpu_kmer_counts = unsafe { stream.alloc::<u32>(n_threads).unwrap() };
+            let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
 
             let f = module.load_function("cuda_kmer_t1ha2").unwrap();
             let mut builder = stream.launch_builder(&f);
@@ -1111,7 +922,6 @@ pub fn cuda_t1ha2_hash_parallel(
             builder.arg(&n_bps);
             builder.arg(&kmer_per_thread);
             builder.arg(&n_hash_per_thread);
-            builder.arg(&n_threads);
             builder.arg(&ksize);
 
             let full_threshold = u64::MAX;
@@ -1120,7 +930,6 @@ pub fn cuda_t1ha2_hash_parallel(
             builder.arg(&seed);
             builder.arg(&canonical);
             builder.arg(&mut gpu_kmer_hash);
-            builder.arg(&mut gpu_kmer_counts);
 
             unsafe {
                 builder
@@ -1129,19 +938,13 @@ pub fn cuda_t1ha2_hash_parallel(
             }
 
             let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
-            let host_kmer_counts = stream.clone_dtoh(&gpu_kmer_counts).unwrap();
             let threshold = u64::MAX / scaled;
-            let mut full_hashes = Vec::new();
-            materialize_counted_kmer_hashes(
-                &host_kmer_hash,
-                &host_kmer_counts,
-                n_hash_per_thread,
-                &mut full_hashes,
-            )
-            .unwrap();
 
             pb.inc(1);
-            full_hashes.into_iter().filter(|&h| h < threshold).collect()
+            host_kmer_hash
+                .into_iter()
+                .filter(|&h| h != 0 && h < threshold)
+                .collect()
         })
         .collect();
 

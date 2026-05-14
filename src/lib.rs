@@ -263,11 +263,9 @@ mod tests {
         let one_hash = HashSet::from([0x1234_5678_9abc_def0]);
         let one_hash_hv = hd::encode_hash_hd(&one_hash, &sketch_for_hv(128));
         assert_eq!(one_hash_hv.len(), 128);
-        assert!(
-            one_hash_hv
-                .iter()
-                .all(|&coordinate| coordinate == -1 || coordinate == 1)
-        );
+        assert!(one_hash_hv
+            .iter()
+            .all(|&coordinate| coordinate == -1 || coordinate == 1));
 
         let zero_hash = HashSet::from([0]);
         let zero_hash_hv = hd::encode_hash_hd(&zero_hash, &sketch_for_hv(64));
@@ -280,11 +278,9 @@ mod tests {
         let short_sketch = sketch_for_hv(70);
         let short_hv = hd::encode_hash_hd(&one_hash, &short_sketch);
         assert_eq!(short_hv.len(), 70);
-        assert!(
-            short_hv[..64]
-                .iter()
-                .all(|&coordinate| coordinate == -1 || coordinate == 1)
-        );
+        assert!(short_hv[..64]
+            .iter()
+            .all(|&coordinate| coordinate == -1 || coordinate == 1));
         assert_eq!(&short_hv[64..], &[-1; 6]);
 
         let multi_hashes =

@@ -121,7 +121,11 @@ pub fn dump_ull_sketch(file_ull_sketch: &Vec<FileUllSketch>, out_file_path: &Pat
 
     info!(
         "Dump compressed ULL sketch file to {} with compressed size {:.2} MB (raw {:.2} MB, ratio {:.3}, zstd threads {})",
-        out_filename, compressed_size_mb, raw_size_mb, ratio, n_threads
+        out_filename,
+        compressed_size_mb,
+        raw_size_mb,
+        ratio,
+        n_threads
     );
 }
 
@@ -282,8 +286,8 @@ pub fn dump_ani_file(sketch_dist: &SketchDist) {
         if sketch_dist.file_ani[indices[i]].1 >= sketch_dist.ani_threshold {
             csv_str.push_str(&format!(
                 "{}\t{}\t{:.3}\n",
-                sketch_dist.file_ani[indices[i]].0.0,
-                sketch_dist.file_ani[indices[i]].0.1,
+                sketch_dist.file_ani[indices[i]].0 .0,
+                sketch_dist.file_ani[indices[i]].0 .1,
                 sketch_dist.file_ani[indices[i]].1
             ));
             cnt += 1.0;
