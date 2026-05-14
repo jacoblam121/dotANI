@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cudarc::driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg};
 
-const HASH_TILE: usize = 256;
-const MAX_KERNEL_WARPS: usize = 8;
+pub(crate) const HASH_TILE: usize = 256;
+pub(crate) const MAX_KERNEL_WARPS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuHdEncodeMetrics {

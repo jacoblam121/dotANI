@@ -5,7 +5,10 @@ use {
     crate::{dist, fastx_reader, hd, hd_cuda, utils},
     anyhow::{Result, anyhow},
     cudarc::{
-        driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg},
+        driver::{
+            CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig,
+            PushKernelArg,
+        },
         nvrtc::Ptx,
     },
     glob::glob,
@@ -46,6 +49,110 @@ struct IndexedSketchResult {
     sketch: FileSketch,
     ull_record: Option<FileUllSketch>,
     metrics: FileSketchMetrics,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaSketchLaneScratch {
+    lane_id: usize,
+    dev_id: usize,
+    _ctx: Arc<CudaContext>,
+    _module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+    kmer_fn: CudaFunction,
+    hd_fn: CudaFunction,
+    full_hashes: Vec<u64>,
+    sampled_hashes: Vec<u64>,
+    sampled_hash_set: HashSet<u64>,
+    host_kmer_hash: Vec<u64>,
+    hv_host: Vec<i32>,
+    d_seq: Option<CudaSlice<u8>>,
+    d_kmer_hash: Option<CudaSlice<u64>>,
+    d_hd_hashes: Option<CudaSlice<u64>>,
+    d_hv: Option<CudaSlice<i32>>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaSketchLaneScratch {
+    fn new(lane_id: usize, dev_id: usize) -> Result<Self> {
+        let ctx = CudaContext::new(dev_id)?;
+        let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))?;
+        let stream = ctx.default_stream();
+        let kmer_fn = module.load_function("cuda_kmer_t1ha2")?;
+        let hd_fn = module.load_function("cuda_hd_encode_counts_direct")?;
+
+        Ok(Self {
+            lane_id,
+            dev_id,
+            _ctx: ctx,
+            _module: module,
+            stream,
+            kmer_fn,
+            hd_fn,
+            full_hashes: Vec::new(),
+            sampled_hashes: Vec::new(),
+            sampled_hash_set: HashSet::new(),
+            host_kmer_hash: Vec::new(),
+            hv_host: Vec::new(),
+            d_seq: None,
+            d_kmer_hash: None,
+            d_hd_hashes: None,
+            d_hv: None,
+        })
+    }
+
+    fn ensure_seq_capacity(&mut self, needed: usize) -> Result<u128> {
+        let start = Instant::now();
+        if self.d_seq.as_ref().map_or(0, |buf| buf.len()) < needed {
+            let capacity = grow_capacity(self.d_seq.as_ref().map_or(0, |buf| buf.len()), needed);
+            self.d_seq = Some(unsafe { self.stream.alloc::<u8>(capacity)? });
+        }
+        Ok(start.elapsed().as_nanos())
+    }
+
+    fn ensure_kmer_hash_capacity(&mut self, needed: usize) -> Result<u128> {
+        let start = Instant::now();
+        if self.d_kmer_hash.as_ref().map_or(0, |buf| buf.len()) < needed {
+            let capacity =
+                grow_capacity(self.d_kmer_hash.as_ref().map_or(0, |buf| buf.len()), needed);
+            self.d_kmer_hash = Some(unsafe { self.stream.alloc::<u64>(capacity)? });
+        }
+        Ok(start.elapsed().as_nanos())
+    }
+
+    fn ensure_hd_hash_capacity(&mut self, needed: usize) -> Result<u128> {
+        let start = Instant::now();
+        if self.d_hd_hashes.as_ref().map_or(0, |buf| buf.len()) < needed {
+            let capacity =
+                grow_capacity(self.d_hd_hashes.as_ref().map_or(0, |buf| buf.len()), needed);
+            self.d_hd_hashes = Some(unsafe { self.stream.alloc::<u64>(capacity)? });
+        }
+        Ok(start.elapsed().as_nanos())
+    }
+
+    fn ensure_hv_capacity(&mut self, needed: usize) -> Result<u128> {
+        let start = Instant::now();
+        if self.d_hv.as_ref().map_or(0, |buf| buf.len()) < needed {
+            let capacity = grow_capacity(self.d_hv.as_ref().map_or(0, |buf| buf.len()), needed);
+            self.d_hv = Some(unsafe { self.stream.alloc::<i32>(capacity)? });
+        }
+        Ok(start.elapsed().as_nanos())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn grow_capacity(current: usize, needed: usize) -> usize {
+    if needed == 0 {
+        return current;
+    }
+
+    let mut capacity = current.max(1);
+    while capacity < needed {
+        capacity = capacity.saturating_mul(2);
+        if capacity == usize::MAX {
+            break;
+        }
+    }
+    capacity
 }
 
 #[allow(unused_variables)]
@@ -121,8 +228,7 @@ pub fn sketch_cuda(params: SketchParams) {
 
             scope.spawn(move || {
                 let worker = || -> Result<()> {
-                    let ctx = Arc::new(CudaContext::new(dev_id)?);
-                    let module = Arc::new(ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))?);
+                    let mut scratch = CudaSketchLaneScratch::new(lane_id, dev_id)?;
 
                     loop {
                         if stop_workers.load(Ordering::Relaxed) {
@@ -134,14 +240,8 @@ pub fn sketch_cuda(params: SketchParams) {
                             break;
                         }
 
-                        let result = sketch_one_file_cuda(
-                            index,
-                            &files[index],
-                            params,
-                            dev_id,
-                            &ctx,
-                            &module,
-                        )?;
+                        let result =
+                            sketch_one_file_cuda(index, &files[index], params, &mut scratch)?;
                         if tx.send(Ok(result)).is_err() {
                             break;
                         }
@@ -305,9 +405,7 @@ fn sketch_one_file_cuda(
     index: usize,
     file: &PathBuf,
     params: &SketchParams,
-    dev_id: usize,
-    ctx: &Arc<CudaContext>,
-    module: &Arc<CudaModule>,
+    scratch: &mut CudaSketchLaneScratch,
 ) -> Result<IndexedSketchResult> {
     let worker_start = Instant::now();
     let mut sketch = FileSketch {
@@ -322,24 +420,24 @@ fn sketch_one_file_cuda(
         hv: Vec::<i32>::new(),
     };
 
-    let (full_hashes, mut metrics) =
-        extract_kmer_t1ha2_cuda_full_hashes(&sketch, dev_id, ctx, module)?;
+    let mut metrics = extract_kmer_t1ha2_cuda_full_hashes_into(&sketch, scratch)?;
     metrics.file = sketch.file_str.clone();
-    metrics.hashes_seen = full_hashes.len();
+    metrics.hashes_seen = scratch.full_hashes.len();
 
     let threshold = u64::MAX / sketch.scaled;
 
     let hash_and_dedup_start = Instant::now();
-    let (sampled_hashes, ull_record) = match params.cuda_dedup_strategy {
+    scratch.sampled_hashes.clear();
+    let ull_record = match params.cuda_dedup_strategy {
         CudaDedupStrategy::HashSet => {
-            let mut sampled_hash_set = HashSet::<u64>::new();
+            scratch.sampled_hash_set.clear();
             let ull_record = if params.if_ull {
                 let mut ull =
                     UltraLogLog::new(params.ull_p).expect("Invalid UltraLogLog precision");
 
-                for &h in &full_hashes {
+                for &h in &scratch.full_hashes {
                     ull.add(h);
-                    sampled_hash_set.insert(h);
+                    scratch.sampled_hash_set.insert(h);
                 }
 
                 Some(FileUllSketch {
@@ -351,57 +449,62 @@ fn sketch_one_file_cuda(
                     ull_state: ull.get_state().to_vec(),
                 })
             } else {
-                for h in full_hashes {
+                for &h in &scratch.full_hashes {
                     if h < threshold {
-                        sampled_hash_set.insert(h);
+                        scratch.sampled_hash_set.insert(h);
                     }
                 }
                 None
             };
 
-            (sampled_hash_set.into_iter().collect(), ull_record)
+            scratch
+                .sampled_hashes
+                .extend(scratch.sampled_hash_set.iter().copied());
+            ull_record
         }
         CudaDedupStrategy::SortUnstable => {
-            let (mut sampled_hashes, ull_record) = if params.if_ull {
+            let ull_record = if params.if_ull {
                 let mut ull =
                     UltraLogLog::new(params.ull_p).expect("Invalid UltraLogLog precision");
 
-                for &h in &full_hashes {
+                for &h in &scratch.full_hashes {
                     ull.add(h);
                 }
 
-                (
-                    full_hashes,
-                    Some(FileUllSketch {
-                        ksize: params.ksize,
-                        canonical: params.canonical,
-                        seed: params.seed,
-                        ull_p: params.ull_p,
-                        file_str: sketch.file_str.clone(),
-                        ull_state: ull.get_state().to_vec(),
-                    }),
-                )
+                scratch.sampled_hashes.extend(&scratch.full_hashes);
+                Some(FileUllSketch {
+                    ksize: params.ksize,
+                    canonical: params.canonical,
+                    seed: params.seed,
+                    ull_p: params.ull_p,
+                    file_str: sketch.file_str.clone(),
+                    ull_state: ull.get_state().to_vec(),
+                })
             } else {
-                (
-                    full_hashes.into_iter().filter(|&h| h < threshold).collect(),
-                    None,
-                )
+                scratch.sampled_hashes.extend(
+                    scratch
+                        .full_hashes
+                        .iter()
+                        .copied()
+                        .filter(|&h| h < threshold),
+                );
+                None
             };
-            sampled_hashes.sort_unstable();
-            sampled_hashes.dedup();
+            scratch.sampled_hashes.sort_unstable();
+            scratch.sampled_hashes.dedup();
 
-            (sampled_hashes, ull_record)
+            ull_record
         }
     };
     let hash_and_dedup_ns = hash_and_dedup_start.elapsed().as_nanos();
     metrics.hash_and_dedup_ns = hash_and_dedup_ns;
     metrics.cuda_filter_ns = Some(hash_and_dedup_ns);
-    metrics.unique_hashes = sampled_hashes.len();
+    metrics.unique_hashes = scratch.sampled_hashes.len();
 
     let start = Instant::now();
-    let (hv, hd_metrics) = hd_cuda::encode_hash_hd_cuda(&sampled_hashes, sketch.hv_d, ctx, module)?;
+    let hd_metrics = encode_hash_hd_cuda_into(scratch, sketch.hv_d)?;
     metrics.hd_encode_ns = start.elapsed().as_nanos();
-    if !sampled_hashes.is_empty() && sketch.hv_d >= 64 {
+    if !scratch.sampled_hashes.is_empty() && sketch.hv_d >= 64 {
         metrics.cuda_hd_hash_h2d_ns = Some(hd_metrics.cuda_hd_hash_h2d_ns);
         metrics.cuda_hd_hv_h2d_ns = Some(hd_metrics.cuda_hd_hv_h2d_ns);
         metrics.cuda_hd_alloc_ns = Some(hd_metrics.cuda_hd_alloc_ns);
@@ -410,14 +513,15 @@ fn sketch_one_file_cuda(
     }
 
     let start = Instant::now();
-    sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
+    let hv = &scratch.hv_host[..sketch.hv_d];
+    sketch.hv_norm_2 = dist::compute_hv_l2_norm(hv);
     metrics.hv_norm_ns = start.elapsed().as_nanos();
 
     let start = Instant::now();
     if params.if_compressed {
-        sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
+        sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, hv) };
     } else {
-        sketch.hv = hv.clone();
+        sketch.hv = hv.to_vec();
     }
     metrics.hd_compress_ns = start.elapsed().as_nanos();
     metrics.total_worker_ns = worker_start.elapsed().as_nanos();
@@ -431,12 +535,12 @@ fn sketch_one_file_cuda(
 }
 
 #[cfg(feature = "cuda")]
-fn extract_kmer_t1ha2_cuda_full_hashes(
+fn extract_kmer_t1ha2_cuda_full_hashes_into(
     sketch: &FileSketch,
-    dev_id: usize,
-    ctx: &Arc<CudaContext>,
-    module: &Arc<CudaModule>,
-) -> Result<(Vec<u64>, FileSketchMetrics)> {
+    scratch: &mut CudaSketchLaneScratch,
+) -> Result<FileSketchMetrics> {
+    scratch.full_hashes.clear();
+
     let fna_file = PathBuf::from(sketch.file_str.clone());
     let fasta_start = Instant::now();
     let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
@@ -446,8 +550,8 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     let mut metrics = FileSketchMetrics {
         input_bases: n_bps,
         fasta_ns,
-        cuda_stream_lane: Some(0),
-        cuda_device_id: Some(dev_id),
+        cuda_stream_lane: Some(scratch.lane_id),
+        cuda_device_id: Some(scratch.dev_id),
         ..FileSketchMetrics::default()
     };
     let ksize = sketch.ksize as usize;
@@ -455,27 +559,43 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     let seed = sketch.seed;
 
     if n_bps < ksize {
-        return Ok((Vec::new(), metrics));
+        return Ok(metrics);
     }
 
     let n_kmers = n_bps - ksize + 1;
     let kmer_per_thread = 512usize;
     let n_threads = n_kmers.div_ceil(kmer_per_thread);
 
-    let stream = ctx.default_stream();
     let n_hash_per_thread = kmer_per_thread;
     let n_hash_array = n_hash_per_thread * n_threads;
-    let alloc_start = Instant::now();
-    let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array)?;
-    metrics.cuda_alloc_ns = Some(alloc_start.elapsed().as_nanos());
+    let seq_alloc_ns = scratch.ensure_seq_capacity(n_bps)?;
+    let hash_alloc_ns = scratch.ensure_kmer_hash_capacity(n_hash_array)?;
+    metrics.cuda_alloc_ns = Some(seq_alloc_ns + hash_alloc_ns);
+
+    let gpu_seq = scratch
+        .d_seq
+        .as_mut()
+        .expect("sequence device buffer should be allocated");
+    let gpu_kmer_hash = scratch
+        .d_kmer_hash
+        .as_mut()
+        .expect("k-mer hash device buffer should be allocated");
 
     let h2d_start = Instant::now();
-    let gpu_seq = stream.clone_htod(&fna_seqs)?;
+    scratch
+        .stream
+        .memcpy_htod(&fna_seqs, &mut gpu_seq.slice_mut(0..n_bps))?;
     metrics.cuda_h2d_ns = Some(h2d_start.elapsed().as_nanos());
 
-    let f = module.load_function("cuda_kmer_t1ha2")?;
-    let mut builder = stream.launch_builder(&f);
-    builder.arg(&gpu_seq);
+    let zero_start = Instant::now();
+    scratch
+        .stream
+        .memset_zeros(&mut gpu_kmer_hash.slice_mut(0..n_hash_array))?;
+    let zero_ns = zero_start.elapsed().as_nanos();
+    metrics.cuda_alloc_ns = Some(metrics.cuda_alloc_ns.unwrap_or(0) + zero_ns);
+
+    let mut builder = scratch.stream.launch_builder(&scratch.kmer_fn);
+    builder.arg(&*gpu_seq);
     builder.arg(&n_bps);
     builder.arg(&kmer_per_thread);
     builder.arg(&n_hash_per_thread);
@@ -486,7 +606,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
 
     builder.arg(&seed);
     builder.arg(&canonical);
-    builder.arg(&mut gpu_kmer_hash);
+    builder.arg(&mut *gpu_kmer_hash);
 
     let launch_start = Instant::now();
     unsafe {
@@ -494,15 +614,122 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     }
     metrics.cuda_launch_ns = Some(launch_start.elapsed().as_nanos());
 
+    scratch.host_kmer_hash.resize(n_hash_array, 0);
     let d2h_start = Instant::now();
-    let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash)?;
+    scratch.stream.memcpy_dtoh(
+        &gpu_kmer_hash.slice(0..n_hash_array),
+        &mut scratch.host_kmer_hash[..n_hash_array],
+    )?;
     metrics.cuda_d2h_ns = Some(d2h_start.elapsed().as_nanos());
 
     let filter_start = Instant::now();
-    let hashes: Vec<u64> = host_kmer_hash.into_iter().filter(|&h| h != 0).collect();
+    scratch.full_hashes.extend(
+        scratch.host_kmer_hash[..n_hash_array]
+            .iter()
+            .copied()
+            .filter(|&h| h != 0),
+    );
     metrics.cuda_zero_filter_ns = Some(filter_start.elapsed().as_nanos());
 
-    Ok((hashes, metrics))
+    Ok(metrics)
+}
+
+#[cfg(feature = "cuda")]
+fn encode_hash_hd_cuda_into(
+    scratch: &mut CudaSketchLaneScratch,
+    hv_d: usize,
+) -> Result<hd_cuda::GpuHdEncodeMetrics> {
+    if hv_d == 0 {
+        return Err(anyhow!("hv_d must be greater than zero"));
+    }
+    if scratch.sampled_hashes.len() > i32::MAX as usize {
+        return Err(anyhow!(
+            "too many hashes for i32 HD count vector: {}",
+            scratch.sampled_hashes.len()
+        ));
+    }
+
+    assert_eq!(
+        hd_cuda::HASH_TILE % 32,
+        0,
+        "HASH_TILE must be a whole number of warps"
+    );
+    assert!(
+        hd_cuda::HASH_TILE / 32 <= hd_cuda::MAX_KERNEL_WARPS,
+        "HASH_TILE exceeds cuda_hd_encode_counts_direct shared-memory layout"
+    );
+
+    let mut metrics = hd_cuda::GpuHdEncodeMetrics::default();
+    scratch.hv_host.resize(hv_d, 0);
+
+    if scratch.sampled_hashes.is_empty() {
+        scratch.hv_host[..hv_d].fill(0);
+        return Ok(metrics);
+    }
+
+    scratch.hv_host[..hv_d].fill(-(scratch.sampled_hashes.len() as i32));
+    let num_chunks = hv_d / 64;
+    if num_chunks == 0 {
+        return Ok(metrics);
+    }
+
+    let hash_alloc_ns = scratch.ensure_hd_hash_capacity(scratch.sampled_hashes.len())?;
+    let hv_alloc_ns = scratch.ensure_hv_capacity(hv_d)?;
+    metrics.cuda_hd_alloc_ns = hash_alloc_ns + hv_alloc_ns;
+
+    let d_hashes = scratch
+        .d_hd_hashes
+        .as_mut()
+        .expect("HD hash device buffer should be allocated");
+    let d_hv = scratch
+        .d_hv
+        .as_mut()
+        .expect("HD vector device buffer should be allocated");
+
+    let hash_h2d_start = Instant::now();
+    scratch.stream.memcpy_htod(
+        &scratch.sampled_hashes,
+        &mut d_hashes.slice_mut(0..scratch.sampled_hashes.len()),
+    )?;
+    metrics.cuda_hd_hash_h2d_ns = hash_h2d_start.elapsed().as_nanos();
+
+    let hv_h2d_start = Instant::now();
+    scratch
+        .stream
+        .memcpy_htod(&scratch.hv_host[..hv_d], &mut d_hv.slice_mut(0..hv_d))?;
+    metrics.cuda_hd_hv_h2d_ns = hv_h2d_start.elapsed().as_nanos();
+
+    let num_hashes = scratch.sampled_hashes.len() as i32;
+    let hv_d_i32 = hv_d as i32;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            num_chunks as u32,
+            scratch.sampled_hashes.len().div_ceil(hd_cuda::HASH_TILE) as u32,
+            1,
+        ),
+        block_dim: (hd_cuda::HASH_TILE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut launch = scratch.stream.launch_builder(&scratch.hd_fn);
+    launch.arg(&*d_hashes);
+    launch.arg(&num_hashes);
+    launch.arg(&hv_d_i32);
+    launch.arg(&mut *d_hv);
+
+    let kernel_launch_start = Instant::now();
+    unsafe {
+        launch.launch(cfg)?;
+    }
+    metrics.cuda_hd_kernel_launch_ns = kernel_launch_start.elapsed().as_nanos();
+
+    let d2h_start = Instant::now();
+    scratch
+        .stream
+        .memcpy_dtoh(&d_hv.slice(0..hv_d), &mut scratch.hv_host[..hv_d])?;
+    metrics.cuda_hd_d2h_ns = d2h_start.elapsed().as_nanos();
+
+    Ok(metrics)
 }
 
 #[cfg(all(test, feature = "cuda"))]

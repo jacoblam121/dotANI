@@ -182,7 +182,7 @@ pub unsafe fn encode_hash_hd_avx512(kmer_hash_set: &HashSet<u64>, sketch: &FileS
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i32>) -> u8 {
+pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &[i32]) -> u8 {
     let hv_d = sketch.hv_d;
 
     let min_hv = *hv.iter().min().unwrap();
