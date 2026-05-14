@@ -232,7 +232,7 @@ pub struct GpuHdEncodeMetrics {
 
 ## Direct WyRng Computation
 
-CPU HD encoding uses `WyRng::seed_from_u64(hash)` and then calls `next_u64()` once per chunk (sequentially). A direct GPU port of this serial implementation wouldn't exactly be parallel and wouldn't be very useful, so the GPU code instead computes RNG output for specific chunks directly.
+CPU HD encoding uses `WyRng::seed_from_u64(hash)` and then calls `next_u64()` once per chunk (sequentially). A direct GPU port of this serial implementation wouldn't exactly be parallel and wouldn't be very useful, so the GPU code computes RNG output for specific chunks directly instead. 
 
 ```cuda
 static const uint64_t WY_P0 = UINT64_C(0xa0761d6478bd642f);
@@ -250,6 +250,14 @@ wyrng_at_chunk(uint64_t hash, int chunk) {
   uint64_t state = hash + (((uint64_t)chunk + 1) * WY_P0);
   return wymum_u64(state ^ WY_P1, state);
 }
+```
+
+- WyRng advances state by adding fixed constant each `next_u64()`, so our constant is 0xa0761d6478bd642f
+- Then WyRng turns state into pseudorandom u64, which is done with the second constant 0xe7037ed1a0b428db and the wynum multiply/xor; reproducing here 
+```cuda
+  uint64_t high = __umul64hi(a, b);
+  uint64_t low = a * b;
+  return high ^ low;
 ```
 
 We do not actually call the Rust WyRng function, rather just implement the same formula, producing the same result. This lets a CUDA thread compute 
