@@ -140,6 +140,20 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("cuda_hd_prng")
+                .long("cuda-hd-prng")
+                .help("CUDA HD PRNG used to generate random hypervector bits")
+                .default_value("wyrng")
+                .value_parser([
+                    "wyrng",
+                    "philox",
+                    "curand_philox10",
+                    "direct_philox10",
+                    "direct_philox7",
+                ])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("metrics_out")
                 .long("metrics-out")
                 .help("Write sketch metrics to <prefix>.summary.tsv and <prefix>.files.tsv")
@@ -258,6 +272,12 @@ fn main() {
             eprintln!("error: --device cuda requires a binary built with --features cuda");
             std::process::exit(2);
         }
+        let cuda_hd_prng =
+            types::CudaHdPrng::from_cli_value(sketch_m.get_one::<String>("cuda_hd_prng").unwrap());
+        if device == "cpu" && cuda_hd_prng != types::CudaHdPrng::Wyrng {
+            eprintln!("error: non-wyrng --cuda-hd-prng values require --device cuda");
+            std::process::exit(2);
+        }
 
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
@@ -278,6 +298,7 @@ fn main() {
             cuda_dedup_strategy: types::CudaDedupStrategy::from_cli_value(
                 sketch_m.get_one::<String>("cuda_dedup").unwrap(),
             ),
+            cuda_hd_prng,
             device,
             if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -326,6 +347,7 @@ fn main() {
             if_compressed: true,
             threads,
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
+            cuda_hd_prng: types::CudaHdPrng::Wyrng,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,
@@ -368,6 +390,7 @@ fn main() {
             if_compressed: true,
             threads,
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
+            cuda_hd_prng: types::CudaHdPrng::Wyrng,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,

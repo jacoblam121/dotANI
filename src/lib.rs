@@ -63,6 +63,46 @@ mod tests {
         test_wymum(state ^ WY_P1, state)
     }
 
+    fn philox4x32_round(ctr: [u32; 4], key: [u32; 2]) -> [u32; 4] {
+        const M0: u32 = 0xD251_1F53;
+        const M1: u32 = 0xCD9E_8D57;
+
+        let product0 = u64::from(M0) * u64::from(ctr[0]);
+        let product1 = u64::from(M1) * u64::from(ctr[2]);
+        let lo0 = product0 as u32;
+        let hi0 = (product0 >> 32) as u32;
+        let lo1 = product1 as u32;
+        let hi1 = (product1 >> 32) as u32;
+
+        [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0]
+    }
+
+    fn philox4x32(mut ctr: [u32; 4], mut key: [u32; 2], rounds: usize) -> [u32; 4] {
+        const W0: u32 = 0x9E37_79B9;
+        const W1: u32 = 0xBB67_AE85;
+
+        for _ in 0..rounds {
+            ctr = philox4x32_round(ctr, key);
+            key[0] = key[0].wrapping_add(W0);
+            key[1] = key[1].wrapping_add(W1);
+        }
+
+        ctr
+    }
+
+    fn direct_philox_at_chunk(hash: u64, chunk: usize, rounds: usize) -> u64 {
+        let chunk_pair = (chunk as u64) >> 1;
+        let ctr = [chunk_pair as u32, (chunk_pair >> 32) as u32, 0, 0];
+        let key = [hash as u32, (hash >> 32) as u32];
+        let out = philox4x32(ctr, key, rounds);
+
+        if chunk & 1 == 0 {
+            (u64::from(out[1]) << 32) | u64::from(out[0])
+        } else {
+            (u64::from(out[3]) << 32) | u64::from(out[2])
+        }
+    }
+
     fn representative_wyrng_hashes() -> [u64; 6] {
         [
             0,
@@ -165,6 +205,60 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_direct_philox_matches_rust_reference() {
+        use cudarc::{
+            driver::{CudaContext, LaunchConfig, PushKernelArg},
+            nvrtc::Ptx,
+        };
+
+        let chunks = representative_wyrng_chunks();
+        let mut host_hashes = Vec::new();
+        let mut host_chunks = Vec::new();
+        let mut expected10 = Vec::new();
+        let mut expected7 = Vec::new();
+
+        for hash in representative_wyrng_hashes() {
+            for chunk in chunks {
+                host_hashes.push(hash);
+                host_chunks.push(chunk as i32);
+                expected10.push(direct_philox_at_chunk(hash, chunk, 10));
+                expected7.push(direct_philox_at_chunk(hash, chunk, 7));
+            }
+        }
+
+        let ctx = CudaContext::new(0).unwrap();
+        let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_PTX)).unwrap();
+        let stream = ctx.default_stream();
+        let gpu_hashes = stream.clone_htod(&host_hashes).unwrap();
+        let gpu_chunks = stream.clone_htod(&host_chunks).unwrap();
+        let mut gpu_out10 = stream.alloc_zeros::<u64>(expected10.len()).unwrap();
+        let mut gpu_out7 = stream.alloc_zeros::<u64>(expected7.len()).unwrap();
+
+        let f = module
+            .load_function("cuda_test_direct_philox_at_chunk")
+            .unwrap();
+        let mut builder = stream.launch_builder(&f);
+        builder.arg(&gpu_hashes);
+        builder.arg(&gpu_chunks);
+        builder.arg(&mut gpu_out10);
+        builder.arg(&mut gpu_out7);
+        let n_outputs = expected10.len() as i32;
+        builder.arg(&n_outputs);
+
+        unsafe {
+            builder
+                .launch(LaunchConfig::for_num_elems(expected10.len() as u32))
+                .unwrap();
+        }
+
+        let actual10 = stream.clone_dtoh(&gpu_out10).unwrap();
+        let actual7 = stream.clone_dtoh(&gpu_out7).unwrap();
+        assert_eq!(actual10, expected10);
+        assert_eq!(actual7, expected7);
+    }
+
+    #[cfg(feature = "cuda")]
     fn cuda_hd_test_module() -> (
         std::sync::Arc<cudarc::driver::CudaContext>,
         std::sync::Arc<cudarc::driver::CudaModule>,
@@ -179,6 +273,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn assert_cuda_hd_matches_cpu(input_hashes: &[u64], hv_d: usize) {
         use crate::hd_cuda;
+        use crate::types::CudaHdPrng;
 
         let sketch = sketch_for_hv(hv_d);
         let hash_set: HashSet<u64> = input_hashes.iter().copied().collect();
@@ -190,8 +285,14 @@ mod tests {
 
         let cpu_hv = hd::encode_hash_hd(&hash_set, &sketch);
         let (ctx, module) = cuda_hd_test_module();
-        let (gpu_hv, _metrics) =
-            hd_cuda::encode_hash_hd_cuda(input_hashes, hv_d, &ctx, &module).unwrap();
+        let (gpu_hv, _metrics) = hd_cuda::encode_hash_hd_cuda_with_prng(
+            input_hashes,
+            hv_d,
+            &ctx,
+            &module,
+            CudaHdPrng::Wyrng,
+        )
+        .unwrap();
 
         assert_eq!(cpu_hv, gpu_hv);
         assert_eq!(
@@ -254,6 +355,64 @@ mod tests {
         assert!(normal_metrics.cuda_hd_d2h_ns > 0);
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_hd_philox_is_deterministic_and_differs_from_wyrng() {
+        use crate::hd_cuda;
+        use crate::types::CudaHdPrng;
+
+        let input_hashes = [0, 1, 0x1234_5678_9abc_def0, 0x8000_0000_0000_0000, u64::MAX];
+        let (ctx, module) = cuda_hd_test_module();
+
+        let (wyrng, _) = hd_cuda::encode_hash_hd_cuda_with_prng(
+            &input_hashes,
+            4096,
+            &ctx,
+            &module,
+            CudaHdPrng::Wyrng,
+        )
+        .unwrap();
+
+        for prng in [
+            CudaHdPrng::CurandPhilox10,
+            CudaHdPrng::DirectPhilox10,
+            CudaHdPrng::DirectPhilox7,
+        ] {
+            let (first, _) =
+                hd_cuda::encode_hash_hd_cuda_with_prng(&input_hashes, 4096, &ctx, &module, prng)
+                    .unwrap();
+            let (second, _) =
+                hd_cuda::encode_hash_hd_cuda_with_prng(&input_hashes, 4096, &ctx, &module, prng)
+                    .unwrap();
+
+            assert_eq!(first, second, "{prng:?} should be deterministic");
+            assert_ne!(first, wyrng, "{prng:?} should differ from wyrng");
+        }
+    }
+
+    #[test]
+    fn cuda_hd_prng_cli_values_are_parsed() {
+        use crate::types::CudaHdPrng;
+
+        assert_eq!(CudaHdPrng::from_cli_value("wyrng"), CudaHdPrng::Wyrng);
+        assert_eq!(
+            CudaHdPrng::from_cli_value("philox"),
+            CudaHdPrng::CurandPhilox10
+        );
+        assert_eq!(
+            CudaHdPrng::from_cli_value("curand_philox10"),
+            CudaHdPrng::CurandPhilox10
+        );
+        assert_eq!(
+            CudaHdPrng::from_cli_value("direct_philox10"),
+            CudaHdPrng::DirectPhilox10
+        );
+        assert_eq!(
+            CudaHdPrng::from_cli_value("direct_philox7"),
+            CudaHdPrng::DirectPhilox7
+        );
+    }
+
     #[test]
     fn hd_encode_cpu_edge_cases_are_explicit() {
         let empty_hashes = HashSet::new();
@@ -263,9 +422,11 @@ mod tests {
         let one_hash = HashSet::from([0x1234_5678_9abc_def0]);
         let one_hash_hv = hd::encode_hash_hd(&one_hash, &sketch_for_hv(128));
         assert_eq!(one_hash_hv.len(), 128);
-        assert!(one_hash_hv
-            .iter()
-            .all(|&coordinate| coordinate == -1 || coordinate == 1));
+        assert!(
+            one_hash_hv
+                .iter()
+                .all(|&coordinate| coordinate == -1 || coordinate == 1)
+        );
 
         let zero_hash = HashSet::from([0]);
         let zero_hash_hv = hd::encode_hash_hd(&zero_hash, &sketch_for_hv(64));
@@ -278,9 +439,11 @@ mod tests {
         let short_sketch = sketch_for_hv(70);
         let short_hv = hd::encode_hash_hd(&one_hash, &short_sketch);
         assert_eq!(short_hv.len(), 70);
-        assert!(short_hv[..64]
-            .iter()
-            .all(|&coordinate| coordinate == -1 || coordinate == 1));
+        assert!(
+            short_hv[..64]
+                .iter()
+                .all(|&coordinate| coordinate == -1 || coordinate == 1)
+        );
         assert_eq!(&short_hv[64..], &[-1; 6]);
 
         let multi_hashes =

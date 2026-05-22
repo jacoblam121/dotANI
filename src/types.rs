@@ -78,6 +78,7 @@ pub struct CliParams {
 
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub cuda_hd_prng: CudaHdPrng,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -111,6 +112,44 @@ impl CudaDedupStrategy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaHdPrng {
+    Wyrng,
+    CurandPhilox10,
+    DirectPhilox10,
+    DirectPhilox7,
+}
+
+impl CudaHdPrng {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "wyrng" => Self::Wyrng,
+            "philox" | "curand_philox10" => Self::CurandPhilox10,
+            "direct_philox10" => Self::DirectPhilox10,
+            "direct_philox7" => Self::DirectPhilox7,
+            _ => panic!("Invalid CUDA HD PRNG: {value}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wyrng => "wyrng",
+            Self::CurandPhilox10 => "curand_philox10",
+            Self::DirectPhilox10 => "direct_philox10",
+            Self::DirectPhilox7 => "direct_philox7",
+        }
+    }
+
+    pub fn kernel_name(self) -> &'static str {
+        match self {
+            Self::Wyrng => "cuda_hd_encode_counts_direct",
+            Self::CurandPhilox10 => "cuda_hd_encode_counts_curand_philox10",
+            Self::DirectPhilox10 => "cuda_hd_encode_counts_direct_philox10",
+            Self::DirectPhilox7 => "cuda_hd_encode_counts_direct_philox7",
+        }
+    }
+}
+
 pub struct SketchParams {
     pub path: PathBuf,
     pub out_file: PathBuf,
@@ -125,6 +164,7 @@ pub struct SketchParams {
     pub if_compressed: bool,
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub cuda_hd_prng: CudaHdPrng,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -148,6 +188,7 @@ impl Default for SketchParams {
             if_compressed: true,
             threads: 1,
             cuda_dedup_strategy: CudaDedupStrategy::HashSet,
+            cuda_hd_prng: CudaHdPrng::Wyrng,
 
             if_ull: false,
             ull_p: 14,
@@ -173,6 +214,7 @@ impl SketchParams {
         new_sketch.if_compressed = params.if_compressed;
         new_sketch.threads = params.threads;
         new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
+        new_sketch.cuda_hd_prng = params.cuda_hd_prng;
 
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;

@@ -1,8 +1,13 @@
 #include "cuda_kernel.h"
+#include <curand_kernel.h>
 #include <stdint.h>
 
 static const uint64_t WY_P0 = UINT64_C(0xa0761d6478bd642f);
 static const uint64_t WY_P1 = UINT64_C(0xe7037ed1a0b428db);
+static const uint32_t DOTANI_PHILOX_M4X32_0 = 0xD2511F53U;
+static const uint32_t DOTANI_PHILOX_M4X32_1 = 0xCD9E8D57U;
+static const uint32_t DOTANI_PHILOX_W32_0 = 0x9E3779B9U;
+static const uint32_t DOTANI_PHILOX_W32_1 = 0xBB67AE85U;
 
 extern "C" __device__ __forceinline__ uint64_t wymum_u64(uint64_t a,
                                                           uint64_t b) {
@@ -23,6 +28,50 @@ extern "C" __global__ void cuda_test_wyrng_at_chunk(const uint64_t *hashes,
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < n) {
     out[tid] = wyrng_at_chunk(hashes[tid], chunks[tid]);
+  }
+}
+
+extern "C" __device__ __forceinline__ uint4 philox4x32_round(uint4 ctr,
+                                                              uint2 key) {
+  uint32_t lo0 = DOTANI_PHILOX_M4X32_0 * ctr.x;
+  uint32_t hi0 = __umulhi(DOTANI_PHILOX_M4X32_0, ctr.x);
+  uint32_t lo1 = DOTANI_PHILOX_M4X32_1 * ctr.z;
+  uint32_t hi1 = __umulhi(DOTANI_PHILOX_M4X32_1, ctr.z);
+
+  return make_uint4(hi1 ^ ctr.y ^ key.x, lo1, hi0 ^ ctr.w ^ key.y, lo0);
+}
+
+extern "C" __device__ __forceinline__ uint4 philox4x32(uint4 ctr, uint2 key,
+                                                        int rounds) {
+  for (int round = 0; round < rounds; round++) {
+    ctr = philox4x32_round(ctr, key);
+    key.x += DOTANI_PHILOX_W32_0;
+    key.y += DOTANI_PHILOX_W32_1;
+  }
+  return ctr;
+}
+
+extern "C" __device__ __forceinline__ uint64_t
+direct_philox_at_chunk(uint64_t hash, int chunk, int rounds) {
+  uint64_t chunk_pair = ((uint64_t)chunk) >> 1;
+  uint4 ctr =
+      make_uint4((uint32_t)chunk_pair, (uint32_t)(chunk_pair >> 32), 0, 0);
+  uint2 key = make_uint2((uint32_t)hash, (uint32_t)(hash >> 32));
+  uint4 out = philox4x32(ctr, key, rounds);
+
+  if ((chunk & 1) == 0) {
+    return ((uint64_t)out.y << 32) | out.x;
+  }
+  return ((uint64_t)out.w << 32) | out.z;
+}
+
+extern "C" __global__ void cuda_test_direct_philox_at_chunk(
+    const uint64_t *hashes, const int *chunks, uint64_t *out10, uint64_t *out7,
+    int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    out10[tid] = direct_philox_at_chunk(hashes[tid], chunks[tid], 10);
+    out7[tid] = direct_philox_at_chunk(hashes[tid], chunks[tid], 7);
   }
 }
 
@@ -70,6 +119,164 @@ cuda_hd_encode_counts_direct(const uint64_t *hashes, int num_hashes, int hv_d,
       atomicAdd(&hv[d], ones * 2);
     }
   }
+}
+
+extern "C" __global__ void
+cuda_hd_encode_counts_curand_philox10(const uint64_t *hashes, int num_hashes,
+                                      int hv_d, int32_t *hv) {
+  int chunk = blockIdx.x;
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+  int hash_idx = blockIdx.y * blockDim.x + tid;
+
+  __shared__ int warp_counts[8][64];
+
+  for (int i = tid; i < num_warps * 64; i += blockDim.x) {
+    warp_counts[i / 64][i % 64] = 0;
+  }
+  __syncthreads();
+
+  uint64_t rnd = 0;
+  bool active = false;
+  if (hash_idx < num_hashes) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(hashes[hash_idx], (uint64_t)chunk, 0, &state);
+    uint4 out = curand4(&state);
+    rnd = ((uint64_t)out.y << 32) | out.x;
+    active = true;
+  }
+
+  for (int bit = 0; bit < 64; bit++) {
+    unsigned int bit_mask =
+        __ballot_sync(0xffffffff, active && ((rnd >> bit) & 1ULL));
+    if (lane == 0) {
+      warp_counts[warp][bit] = __popc(bit_mask);
+    }
+  }
+
+  __syncthreads();
+
+  if (tid < 64) {
+    int d = chunk * 64 + tid;
+    if (d < hv_d) {
+      int ones = 0;
+      for (int w = 0; w < num_warps; w++) {
+        ones += warp_counts[w][tid];
+      }
+      atomicAdd(&hv[d], ones * 2);
+    }
+  }
+}
+
+extern "C" __global__ void
+cuda_hd_encode_counts_direct_philox(const uint64_t *hashes, int num_hashes,
+                                    int hv_d, int32_t *hv) {
+  int chunk = blockIdx.x;
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+  int hash_idx = blockIdx.y * blockDim.x + tid;
+
+  __shared__ int warp_counts[8][64];
+
+  for (int i = tid; i < num_warps * 64; i += blockDim.x) {
+    warp_counts[i / 64][i % 64] = 0;
+  }
+  __syncthreads();
+
+  uint64_t rnd = 0;
+  bool active = false;
+  if (hash_idx < num_hashes) {
+    curandStatePhilox4_32_10_t state;
+    curand_init(hashes[hash_idx], (uint64_t)chunk, 0, &state);
+    uint4 out = curand4(&state);
+    rnd = ((uint64_t)out.y << 32) | out.x;
+    active = true;
+  }
+
+  for (int bit = 0; bit < 64; bit++) {
+    unsigned int bit_mask =
+        __ballot_sync(0xffffffff, active && ((rnd >> bit) & 1ULL));
+    if (lane == 0) {
+      warp_counts[warp][bit] = __popc(bit_mask);
+    }
+  }
+
+  __syncthreads();
+
+  if (tid < 64) {
+    int d = chunk * 64 + tid;
+    if (d < hv_d) {
+      int ones = 0;
+      for (int w = 0; w < num_warps; w++) {
+        ones += warp_counts[w][tid];
+      }
+      atomicAdd(&hv[d], ones * 2);
+    }
+  }
+}
+
+template <int ROUNDS>
+__device__ __forceinline__ void
+cuda_hd_encode_counts_direct_philox_rounds(const uint64_t *hashes,
+                                           int num_hashes, int hv_d,
+                                           int32_t *hv) {
+  int chunk = blockIdx.x;
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp = tid >> 5;
+  int num_warps = blockDim.x >> 5;
+  int hash_idx = blockIdx.y * blockDim.x + tid;
+
+  __shared__ int warp_counts[8][64];
+
+  for (int i = tid; i < num_warps * 64; i += blockDim.x) {
+    warp_counts[i / 64][i % 64] = 0;
+  }
+  __syncthreads();
+
+  uint64_t rnd = 0;
+  bool active = false;
+  if (hash_idx < num_hashes) {
+    rnd = direct_philox_at_chunk(hashes[hash_idx], chunk, ROUNDS);
+    active = true;
+  }
+
+  for (int bit = 0; bit < 64; bit++) {
+    unsigned int bit_mask =
+        __ballot_sync(0xffffffff, active && ((rnd >> bit) & 1ULL));
+    if (lane == 0) {
+      warp_counts[warp][bit] = __popc(bit_mask);
+    }
+  }
+
+  __syncthreads();
+
+  if (tid < 64) {
+    int d = chunk * 64 + tid;
+    if (d < hv_d) {
+      int ones = 0;
+      for (int w = 0; w < num_warps; w++) {
+        ones += warp_counts[w][tid];
+      }
+      atomicAdd(&hv[d], ones * 2);
+    }
+  }
+}
+
+extern "C" __global__ void
+cuda_hd_encode_counts_direct_philox10(const uint64_t *hashes, int num_hashes,
+                                      int hv_d, int32_t *hv) {
+  cuda_hd_encode_counts_direct_philox_rounds<10>(hashes, num_hashes, hv_d, hv);
+}
+
+extern "C" __global__ void
+cuda_hd_encode_counts_direct_philox7(const uint64_t *hashes, int num_hashes,
+                                     int hv_d, int32_t *hv) {
+  cuda_hd_encode_counts_direct_philox_rounds<7>(hashes, num_hashes, hv_d, hv);
 }
 
 extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
