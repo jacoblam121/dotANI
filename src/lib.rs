@@ -63,44 +63,41 @@ mod tests {
         test_wymum(state ^ WY_P1, state)
     }
 
-    fn philox4x32_round(ctr: [u32; 4], key: [u32; 2]) -> [u32; 4] {
-        const M0: u32 = 0xD251_1F53;
-        const M1: u32 = 0xCD9E_8D57;
-
-        let product0 = u64::from(M0) * u64::from(ctr[0]);
-        let product1 = u64::from(M1) * u64::from(ctr[2]);
-        let lo0 = product0 as u32;
-        let hi0 = (product0 >> 32) as u32;
-        let lo1 = product1 as u32;
-        let hi1 = (product1 >> 32) as u32;
-
-        [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0]
+    fn lcg64_next(state: u64) -> u64 {
+        const A: u64 = 2_862_933_555_777_941_757;
+        const C: u64 = 1_442_695_040_888_963_407;
+        state.wrapping_mul(A).wrapping_add(C)
     }
 
-    fn philox4x32(mut ctr: [u32; 4], mut key: [u32; 2], rounds: usize) -> [u32; 4] {
-        const W0: u32 = 0x9E37_79B9;
-        const W1: u32 = 0xBB67_AE85;
+    fn lcg64_advance(state: u64, mut delta: u64) -> u64 {
+        const A: u64 = 2_862_933_555_777_941_757;
+        const C: u64 = 1_442_695_040_888_963_407;
 
-        for _ in 0..rounds {
-            ctr = philox4x32_round(ctr, key);
-            key[0] = key[0].wrapping_add(W0);
-            key[1] = key[1].wrapping_add(W1);
+        let mut acc_mult = 1_u64;
+        let mut acc_plus = 0_u64;
+        let mut cur_mult = A;
+        let mut cur_plus = C;
+
+        while delta > 0 {
+            if delta & 1 != 0 {
+                acc_mult = acc_mult.wrapping_mul(cur_mult);
+                acc_plus = acc_plus.wrapping_mul(cur_mult).wrapping_add(cur_plus);
+            }
+            cur_plus = cur_mult.wrapping_add(1).wrapping_mul(cur_plus);
+            cur_mult = cur_mult.wrapping_mul(cur_mult);
+            delta >>= 1;
         }
 
-        ctr
+        acc_mult.wrapping_mul(state).wrapping_add(acc_plus)
     }
 
-    fn direct_philox_at_chunk(hash: u64, chunk: usize, rounds: usize) -> u64 {
-        let chunk_pair = (chunk as u64) >> 1;
-        let ctr = [chunk_pair as u32, (chunk_pair >> 32) as u32, 0, 0];
-        let key = [hash as u32, (hash >> 32) as u32];
-        let out = philox4x32(ctr, key, rounds);
-
-        if chunk & 1 == 0 {
-            (u64::from(out[1]) << 32) | u64::from(out[0])
-        } else {
-            (u64::from(out[3]) << 32) | u64::from(out[2])
-        }
+    fn lcg64_at_chunk(hash: u64, chunk: usize) -> u64 {
+        let state = lcg64_advance(hash, (chunk as u64).wrapping_mul(2));
+        let state0 = lcg64_next(state);
+        let state1 = lcg64_next(state0);
+        let lo = state0 >> 32;
+        let hi = state1 >> 32;
+        (hi << 32) | lo
     }
 
     fn representative_wyrng_hashes() -> [u64; 6] {
@@ -206,7 +203,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_direct_philox_matches_rust_reference() {
+    fn cuda_lcg64_at_chunk_matches_rust_reference() {
         use cudarc::{
             driver::{CudaContext, LaunchConfig, PushKernelArg},
             nvrtc::Ptx,
@@ -215,15 +212,13 @@ mod tests {
         let chunks = representative_wyrng_chunks();
         let mut host_hashes = Vec::new();
         let mut host_chunks = Vec::new();
-        let mut expected10 = Vec::new();
-        let mut expected7 = Vec::new();
+        let mut expected = Vec::new();
 
         for hash in representative_wyrng_hashes() {
             for chunk in chunks {
                 host_hashes.push(hash);
                 host_chunks.push(chunk as i32);
-                expected10.push(direct_philox_at_chunk(hash, chunk, 10));
-                expected7.push(direct_philox_at_chunk(hash, chunk, 7));
+                expected.push(lcg64_at_chunk(hash, chunk));
             }
         }
 
@@ -232,30 +227,24 @@ mod tests {
         let stream = ctx.default_stream();
         let gpu_hashes = stream.clone_htod(&host_hashes).unwrap();
         let gpu_chunks = stream.clone_htod(&host_chunks).unwrap();
-        let mut gpu_out10 = stream.alloc_zeros::<u64>(expected10.len()).unwrap();
-        let mut gpu_out7 = stream.alloc_zeros::<u64>(expected7.len()).unwrap();
+        let mut gpu_out = stream.alloc_zeros::<u64>(expected.len()).unwrap();
 
-        let f = module
-            .load_function("cuda_test_direct_philox_at_chunk")
-            .unwrap();
+        let f = module.load_function("cuda_test_lcg64_at_chunk").unwrap();
         let mut builder = stream.launch_builder(&f);
         builder.arg(&gpu_hashes);
         builder.arg(&gpu_chunks);
-        builder.arg(&mut gpu_out10);
-        builder.arg(&mut gpu_out7);
-        let n_outputs = expected10.len() as i32;
+        builder.arg(&mut gpu_out);
+        let n_outputs = expected.len() as i32;
         builder.arg(&n_outputs);
 
         unsafe {
             builder
-                .launch(LaunchConfig::for_num_elems(expected10.len() as u32))
+                .launch(LaunchConfig::for_num_elems(expected.len() as u32))
                 .unwrap();
         }
 
-        let actual10 = stream.clone_dtoh(&gpu_out10).unwrap();
-        let actual7 = stream.clone_dtoh(&gpu_out7).unwrap();
-        assert_eq!(actual10, expected10);
-        assert_eq!(actual7, expected7);
+        let actual = stream.clone_dtoh(&gpu_out).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[cfg(feature = "cuda")]
@@ -357,7 +346,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    fn cuda_hd_philox_is_deterministic_and_differs_from_wyrng() {
+    fn cuda_hd_prngs_are_deterministic_and_differ_from_wyrng() {
         use crate::hd_cuda;
         use crate::types::CudaHdPrng;
 
@@ -375,8 +364,8 @@ mod tests {
 
         for prng in [
             CudaHdPrng::CurandPhilox10,
-            CudaHdPrng::DirectPhilox10,
-            CudaHdPrng::DirectPhilox7,
+            CudaHdPrng::CurandXorwow,
+            CudaHdPrng::Lcg64,
         ] {
             let (first, _) =
                 hd_cuda::encode_hash_hd_cuda_with_prng(&input_hashes, 4096, &ctx, &module, prng)
@@ -404,13 +393,10 @@ mod tests {
             CudaHdPrng::CurandPhilox10
         );
         assert_eq!(
-            CudaHdPrng::from_cli_value("direct_philox10"),
-            CudaHdPrng::DirectPhilox10
+            CudaHdPrng::from_cli_value("curand_xorwow"),
+            CudaHdPrng::CurandXorwow
         );
-        assert_eq!(
-            CudaHdPrng::from_cli_value("direct_philox7"),
-            CudaHdPrng::DirectPhilox7
-        );
+        assert_eq!(CudaHdPrng::from_cli_value("lcg64"), CudaHdPrng::Lcg64);
     }
 
     #[test]
