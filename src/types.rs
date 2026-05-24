@@ -116,8 +116,8 @@ impl CudaDedupStrategy {
 pub enum CudaHdPrng {
     Wyrng,
     CurandPhilox10,
-    CurandXorwow,
-    Lcg64,
+    DirectPhilox10,
+    DirectPhilox7,
 }
 
 impl CudaHdPrng {
@@ -125,8 +125,8 @@ impl CudaHdPrng {
         match value {
             "wyrng" => Self::Wyrng,
             "philox" | "curand_philox10" => Self::CurandPhilox10,
-            "curand_xorwow" => Self::CurandXorwow,
-            "lcg64" => Self::Lcg64,
+            "direct_philox10" => Self::DirectPhilox10,
+            "direct_philox7" => Self::DirectPhilox7,
             _ => panic!("Invalid CUDA HD PRNG: {value}"),
         }
     }
@@ -135,8 +135,8 @@ impl CudaHdPrng {
         match self {
             Self::Wyrng => "wyrng",
             Self::CurandPhilox10 => "curand_philox10",
-            Self::CurandXorwow => "curand_xorwow",
-            Self::Lcg64 => "lcg64",
+            Self::DirectPhilox10 => "direct_philox10",
+            Self::DirectPhilox7 => "direct_philox7",
         }
     }
 
@@ -144,8 +144,8 @@ impl CudaHdPrng {
         match self {
             Self::Wyrng => "cuda_hd_encode_counts_direct",
             Self::CurandPhilox10 => "cuda_hd_encode_counts_curand_philox10",
-            Self::CurandXorwow => "cuda_hd_encode_counts_curand_xorwow",
-            Self::Lcg64 => "cuda_hd_encode_counts_lcg64",
+            Self::DirectPhilox10 => "cuda_hd_encode_counts_direct_philox10",
+            Self::DirectPhilox7 => "cuda_hd_encode_counts_direct_philox7",
         }
     }
 }

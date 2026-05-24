@@ -148,8 +148,8 @@ fn main() {
                     "wyrng",
                     "philox",
                     "curand_philox10",
-                    "curand_xorwow",
-                    "lcg64",
+                    "direct_philox10",
+                    "direct_philox7",
                 ])
                 .action(ArgAction::Set),
         )
