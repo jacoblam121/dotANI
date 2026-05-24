@@ -4,8 +4,6 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use cudarc::driver::{CudaContext, CudaModule, LaunchConfig, PushKernelArg};
 
-use crate::types::CudaHdPrng;
-
 pub(crate) const HASH_TILE: usize = 256;
 pub(crate) const MAX_KERNEL_WARPS: usize = 8;
 
@@ -23,16 +21,6 @@ pub fn encode_hash_hd_cuda(
     hv_d: usize,
     ctx: &Arc<CudaContext>,
     module: &Arc<CudaModule>,
-) -> Result<(Vec<i32>, GpuHdEncodeMetrics)> {
-    encode_hash_hd_cuda_with_prng(hashes, hv_d, ctx, module, CudaHdPrng::Wyrng)
-}
-
-pub fn encode_hash_hd_cuda_with_prng(
-    hashes: &[u64],
-    hv_d: usize,
-    ctx: &Arc<CudaContext>,
-    module: &Arc<CudaModule>,
-    prng: CudaHdPrng,
 ) -> Result<(Vec<i32>, GpuHdEncodeMetrics)> {
     if hv_d == 0 {
         bail!("hv_d must be greater than zero");
@@ -76,7 +64,7 @@ pub fn encode_hash_hd_cuda_with_prng(
     stream.memcpy_htod(&hv_host, &mut d_hv)?;
     metrics.cuda_hd_hv_h2d_ns = hv_h2d_start.elapsed().as_nanos();
 
-    let function = module.load_function(prng.kernel_name())?;
+    let function = module.load_function("cuda_hd_encode_counts_direct")?;
     let num_hashes = hashes.len() as i32;
     let hv_d_i32 = hv_d as i32;
     let cfg = LaunchConfig {

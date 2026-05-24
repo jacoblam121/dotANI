@@ -73,12 +73,12 @@ struct CudaSketchLaneScratch {
 
 #[cfg(feature = "cuda")]
 impl CudaSketchLaneScratch {
-    fn new(lane_id: usize, dev_id: usize, params: &SketchParams) -> Result<Self> {
+    fn new(lane_id: usize, dev_id: usize) -> Result<Self> {
         let ctx = CudaContext::new(dev_id)?;
         let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))?;
         let stream = ctx.default_stream();
         let kmer_fn = module.load_function("cuda_kmer_t1ha2")?;
-        let hd_fn = module.load_function(params.cuda_hd_prng.kernel_name())?;
+        let hd_fn = module.load_function("cuda_hd_encode_counts_direct")?;
 
         Ok(Self {
             lane_id,
@@ -210,7 +210,6 @@ pub fn sketch_cuda(params: SketchParams) {
         "Using CUDA dedup strategy: {}",
         params.cuda_dedup_strategy.as_str()
     );
-    info!("Using CUDA HD PRNG: {}", params.cuda_hd_prng.as_str());
 
     let next_file = Arc::new(AtomicUsize::new(0));
     let stop_workers = Arc::new(AtomicBool::new(false));
@@ -229,7 +228,7 @@ pub fn sketch_cuda(params: SketchParams) {
 
             scope.spawn(move || {
                 let worker = || -> Result<()> {
-                    let mut scratch = CudaSketchLaneScratch::new(lane_id, dev_id, params)?;
+                    let mut scratch = CudaSketchLaneScratch::new(lane_id, dev_id)?;
 
                     loop {
                         if stop_workers.load(Ordering::Relaxed) {
