@@ -1,5 +1,4 @@
 /target/
-/dotani_outputs/
 Cargo.lock
 *.sketch
 *.sketch.ull
