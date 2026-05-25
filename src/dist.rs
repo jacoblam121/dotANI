@@ -10,7 +10,9 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+#[cfg(feature = "cuda")]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
@@ -23,20 +25,25 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
+    let ull_load_start = Instant::now();
     let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path());
     let query_ull_sketch = if if_sym {
         ref_ull_sketch.clone()
     } else {
         utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())
     };
+    let ull_load_secs = ull_load_start.elapsed().as_secs_f32();
 
+    let sketch_load_start = Instant::now();
     let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path());
     let mut query_file_sketch = if if_sym {
         ref_file_sketch.clone()
     } else {
         utils::load_sketch(sketch_dist.path_query_sketch.as_path())
     };
+    let sketch_load_secs = sketch_load_start.elapsed().as_secs_f32();
 
+    let validation_start = Instant::now();
     assert_eq!(
         ref_file_sketch.len(),
         ref_ull_sketch.len(),
@@ -74,10 +81,14 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         hv_d_ref, hv_d_query,
         "Ref and query sketches use different HV dimensions!"
     );
+    let validation_secs = validation_start.elapsed().as_secs_f32();
 
+    let decompress_start = Instant::now();
     hd::decompress_file_sketch(&mut ref_file_sketch);
     hd::decompress_file_sketch(&mut query_file_sketch);
+    let decompress_secs = decompress_start.elapsed().as_secs_f32();
 
+    let compute_start = Instant::now();
     compute_hv_ani(
         sketch_dist,
         &ref_file_sketch,
@@ -87,12 +98,18 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         ksize_ref,
         if_sym,
     );
+    let compute_secs = compute_start.elapsed().as_secs_f32();
 
     info!(
-        "Computed ANIs for {} ref files and {} query files took {:.3}s",
+        "dist timings: ull_load={:.3}s sketch_load={:.3}s validation={:.3}s decompress={:.3}s compute_write={:.3}s total={:.3}s refs={} queries={}",
+        ull_load_secs,
+        sketch_load_secs,
+        validation_secs,
+        decompress_secs,
+        compute_secs,
+        tstart.elapsed().as_secs_f32(),
         ref_file_sketch.len(),
-        query_file_sketch.len(),
-        tstart.elapsed().as_secs_f32()
+        query_file_sketch.len()
     );
 }
 
@@ -276,7 +293,6 @@ fn stream_hv_ani_cpu(
         File::create(out_path).expect("Failed to create ANI output file"),
     )));
     let total_hits = AtomicUsize::new(0);
-    let debug_seen = AtomicUsize::new(0);
 
     let row_starts: Vec<usize> = (0..ref_filesketch.len()).step_by(ROW_BLOCK).collect();
 
@@ -303,38 +319,12 @@ fn stream_hv_ani_cpu(
                     ksize,
                 );
 
-                let dbg_idx = debug_seen.fetch_add(1, Ordering::Relaxed);
-                if dbg_idx < 8 {
-                    let union_hat = ref_cards[i] + query_cards[j] - inter_hat;
-                    let jaccard = if union_hat > 0.0 {
-                        inter_hat / union_hat
-                    } else {
-                        -1.0
-                    };
-
-                    info!(
-                        "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
-                        dbg_idx,
-                        r.file_str,
-                        q.file_str,
-                        ref_cards[i],
-                        query_cards[j],
-                        dot,
-                        inter_hat,
-                        union_hat,
-                        jaccard,
-                        ani
-                    );
-                }
-
                 if ani >= ani_threshold {
                     use std::fmt::Write as _;
                     let _ = writeln!(
                         &mut local_text,
                         "{}\t{}\t{:.3}",
-                        r.file_str,
-                        q.file_str,
-                        ani
+                        r.file_str, q.file_str, ani
                     );
                     local_hits += 1;
                 }
@@ -426,7 +416,7 @@ fn stream_hv_ani_gpu_multi(
     let next = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
 
-    std::thread::scope(|scope| {
+    std::thread::scope(|scope| -> anyhow::Result<usize> {
         for dev_id in 0..ng {
             let tx = tx.clone();
             let jobs = Arc::clone(&jobs);
@@ -510,12 +500,11 @@ fn stream_hv_ani_gpu_multi(
                             }
                         }
 
-                        tx.send(Ok(TileBatchResult {
+                        let _ = tx.send(Ok(TileBatchResult {
                             text,
                             num_hits,
                             num_pairs_done,
-                        }))
-                        .expect("Failed to send tile batch result");
+                        }));
                     }
 
                     Ok(())
@@ -526,25 +515,41 @@ fn stream_hv_ani_gpu_multi(
                 }
             });
         }
-    });
 
-    drop(tx);
+        drop(tx);
 
-    let mut total_hits = 0usize;
-    for _ in 0..total_jobs {
-        match rx.recv().expect("GPU worker channel closed unexpectedly") {
-            Ok(batch) => {
-                writer
-                    .write_all(batch.text.as_bytes())
-                    .expect("Failed to write ANI batch");
-                total_hits += batch.num_hits;
-                pb.inc(batch.num_pairs_done as u64);
+        let mut total_hits = 0usize;
+        let mut received_jobs = 0usize;
+        let mut first_error = None;
+
+        while received_jobs < total_jobs {
+            match rx.recv() {
+                Ok(Ok(batch)) => {
+                    received_jobs += 1;
+                    writer
+                        .write_all(batch.text.as_bytes())
+                        .expect("Failed to write ANI batch");
+                    total_hits += batch.num_hits;
+                    pb.inc(batch.num_pairs_done as u64);
+                }
+                Ok(Err(e)) => {
+                    first_error.get_or_insert(e);
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!("GPU worker channel closed unexpectedly: {e}")
+                    });
+                    break;
+                }
             }
-            Err(e) => return Err(e),
         }
-    }
 
-    Ok(total_hits)
+        if let Some(e) = first_error {
+            Err(e)
+        } else {
+            Ok(total_hits)
+        }
+    })
 }
 
 pub fn compute_hv_ani(
@@ -556,6 +561,7 @@ pub fn compute_hv_ani(
     ksize: u8,
     if_symmetric: bool,
 ) {
+    let compute_start = Instant::now();
     info!("Computing ANI..");
 
     let num_ref_files = ref_filesketch.len();
@@ -569,6 +575,7 @@ pub fn compute_hv_ani(
 
     let pb = utils::get_progress_bar(num_dists);
 
+    let cardinality_start = Instant::now();
     let ref_cards: Vec<f64> = ref_ull_sketch
         .par_iter()
         .map(|s| ull_cardinality_from_state(&s.ull_state))
@@ -582,64 +589,73 @@ pub fn compute_hv_ani(
             .map(|s| ull_cardinality_from_state(&s.ull_state))
             .collect()
     };
+    let cardinality_secs = cardinality_start.elapsed().as_secs_f32();
 
-    let num_hits = {
-        #[cfg(feature = "cuda")]
-        {
-            let out_file = File::create(sketch_dist.out_file.as_path())
-                .expect("Failed to create ANI output file");
-            let mut writer = BufWriter::new(out_file);
+    let stream_start = Instant::now();
+    #[cfg(feature = "cuda")]
+    let (num_hits, output_open_secs, flush_secs, stream_mode) = {
+        let output_open_start = Instant::now();
+        let out_file =
+            File::create(sketch_dist.out_file.as_path()).expect("Failed to create ANI output file");
+        let mut writer = BufWriter::new(out_file);
+        let output_open_secs = output_open_start.elapsed().as_secs_f32();
 
-            match stream_hv_ani_gpu_multi(
-                &mut writer,
-                &pb,
-                ref_filesketch,
-                query_filesketch,
-                &ref_cards,
-                &query_cards,
-                ksize,
-                if_symmetric,
-                sketch_dist.ani_threshold,
-            ) {
-                Ok(n) => {
-                    writer.flush().expect("Failed to flush ANI output");
-                    info!("Multi-GPU tiled dot-product completed successfully");
-                    n
-                }
-                Err(e) => {
-                    warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
-                    drop(writer);
-                    stream_hv_ani_cpu(
-                        sketch_dist.out_file.as_path(),
-                        &pb,
-                        ref_filesketch,
-                        query_filesketch,
-                        &ref_cards,
-                        &query_cards,
-                        ksize,
-                        if_symmetric,
-                        sketch_dist.ani_threshold,
-                    )
-                }
+        match stream_hv_ani_gpu_multi(
+            &mut writer,
+            &pb,
+            ref_filesketch,
+            query_filesketch,
+            &ref_cards,
+            &query_cards,
+            ksize,
+            if_symmetric,
+            sketch_dist.ani_threshold,
+        ) {
+            Ok(n) => {
+                let flush_start = Instant::now();
+                writer.flush().expect("Failed to flush ANI output");
+                let flush_secs = flush_start.elapsed().as_secs_f32();
+                info!("Multi-GPU tiled dot-product completed successfully");
+                (n, output_open_secs, flush_secs, "gpu")
             }
-        }
-
-        #[cfg(not(feature = "cuda"))]
-        {
-            stream_hv_ani_cpu(
-                sketch_dist.out_file.as_path(),
-                &pb,
-                ref_filesketch,
-                query_filesketch,
-                &ref_cards,
-                &query_cards,
-                ksize,
-                if_symmetric,
-                sketch_dist.ani_threshold,
-            )
+            Err(e) => {
+                warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
+                drop(writer);
+                pb.set_position(0);
+                let n = stream_hv_ani_cpu(
+                    sketch_dist.out_file.as_path(),
+                    &pb,
+                    ref_filesketch,
+                    query_filesketch,
+                    &ref_cards,
+                    &query_cards,
+                    ksize,
+                    if_symmetric,
+                    sketch_dist.ani_threshold,
+                );
+                (n, output_open_secs, 0.0, "gpu_fallback_cpu")
+            }
         }
     };
 
+    #[cfg(not(feature = "cuda"))]
+    let (num_hits, output_open_secs, flush_secs, stream_mode) = {
+        let n = stream_hv_ani_cpu(
+            sketch_dist.out_file.as_path(),
+            &pb,
+            ref_filesketch,
+            query_filesketch,
+            &ref_cards,
+            &query_cards,
+            ksize,
+            if_symmetric,
+            sketch_dist.ani_threshold,
+        );
+        (n, 0.0, 0.0, "cpu")
+    };
+    let stream_secs = stream_start.elapsed().as_secs_f32();
+
+    let summary_start = Instant::now();
     pb.finish_and_clear();
 
     let total_dist = num_dists as u64;
@@ -664,4 +680,16 @@ pub fn compute_hv_ani(
             sketch_dist.out_file.to_string_lossy()
         );
     }
+    let summary_secs = summary_start.elapsed().as_secs_f32();
+
+    info!(
+        "compute_hv_ani timings: cardinality={:.3}s output_open={:.3}s stream_mode={} stream={:.3}s flush={:.3}s summary={:.3}s total={:.3}s",
+        cardinality_secs,
+        output_open_secs,
+        stream_mode,
+        stream_secs,
+        flush_secs,
+        summary_secs,
+        compute_start.elapsed().as_secs_f32()
+    );
 }
