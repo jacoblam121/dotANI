@@ -7,11 +7,13 @@ use crate::utils;
 use log::{info, warn};
 use rayon::prelude::*;
 
+#[cfg(feature = "cuda")]
+use crossbeam_channel as channel;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "cuda")]
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -391,6 +393,32 @@ struct GpuTileJob {
 }
 
 #[cfg(feature = "cuda")]
+struct DotTileBatch {
+    job: GpuTileJob,
+    nq: usize,
+    nr: usize,
+    tile_dots: Vec<i64>,
+    num_pairs_done: usize,
+    candidate_pairs: usize,
+    prefilter_skipped: usize,
+    ref_flatten_events: usize,
+    flatten_ref_ns: u128,
+    flatten_query_ns: u128,
+    query_h2d_ns: u128,
+    ref_h2d_ns: u128,
+    compute_d2h_ns: u128,
+    gpu_tile_total_ns: u128,
+    query_h2d_bytes: usize,
+    ref_h2d_bytes: usize,
+    out_d2h_bytes: usize,
+    ref_uploads: usize,
+    resident_tiles: usize,
+    resident_fallback_tiles: usize,
+    resident_upload_ns: u128,
+    resident_upload_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
 struct TileBatchResult {
     text: String,
     num_hits: usize,
@@ -437,6 +465,8 @@ struct GpuStreamBreakdown {
     compute_d2h_ns: u128,
     gpu_tile_total_ns: u128,
     postprocess_ns: u128,
+    gpu_send_blocked_ns: u128,
+    postprocess_result_send_blocked_ns: u128,
     write_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
@@ -486,6 +516,100 @@ fn ns_to_secs(ns: u128) -> f64 {
 }
 
 #[cfg(feature = "cuda")]
+enum GpuPipelineMessage {
+    Batch(anyhow::Result<TileBatchResult>),
+}
+
+#[cfg(feature = "cuda")]
+fn postprocess_dot_tile_batch(
+    batch: DotTileBatch,
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cards: &[f64],
+    query_cards: &[f64],
+    ksize: u8,
+    if_symmetric: bool,
+    ani_threshold: f32,
+) -> TileBatchResult {
+    let postprocess_start = Instant::now();
+    let mut text = String::new();
+    let mut num_hits = 0usize;
+    let mut num_pairs_done = 0usize;
+    let mut ani_evals = 0usize;
+    let mut nonpositive_skipped = 0usize;
+
+    for q_local in 0..batch.nq {
+        for r_local in 0..batch.nr {
+            let i = batch.job.i0 + r_local;
+            let j = batch.job.j0 + q_local;
+
+            if if_symmetric && i >= j {
+                continue;
+            }
+
+            num_pairs_done += 1;
+
+            let dot = batch.tile_dots[q_local * batch.nr + r_local] as f64;
+            let inter_hat = dot / ref_filesketch[i].hv_d as f64;
+            if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                nonpositive_skipped += 1;
+                continue;
+            }
+
+            ani_evals += 1;
+            let ani = ani_from_intersection_and_cardinalities(
+                inter_hat,
+                ref_cards[i],
+                query_cards[j],
+                ksize,
+            );
+
+            if ani >= ani_threshold {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    &mut text,
+                    "{}\t{}\t{:.3}",
+                    ref_filesketch[i].file_str, query_filesketch[j].file_str, ani
+                );
+                num_hits += 1;
+            }
+        }
+    }
+
+    debug_assert!(batch.num_pairs_done >= num_pairs_done);
+    debug_assert_eq!(batch.candidate_pairs, batch.num_pairs_done);
+    let postprocess_ns = postprocess_start.elapsed().as_nanos();
+    let text_bytes = text.len();
+
+    TileBatchResult {
+        text,
+        num_hits,
+        num_pairs_done,
+        candidate_pairs: num_pairs_done,
+        prefilter_skipped: batch.prefilter_skipped,
+        ani_evals,
+        nonpositive_skipped,
+        text_bytes,
+        ref_flatten_events: batch.ref_flatten_events,
+        flatten_ref_ns: batch.flatten_ref_ns,
+        flatten_query_ns: batch.flatten_query_ns,
+        query_h2d_ns: batch.query_h2d_ns,
+        ref_h2d_ns: batch.ref_h2d_ns,
+        compute_d2h_ns: batch.compute_d2h_ns,
+        gpu_tile_total_ns: batch.gpu_tile_total_ns,
+        postprocess_ns,
+        query_h2d_bytes: batch.query_h2d_bytes,
+        ref_h2d_bytes: batch.ref_h2d_bytes,
+        out_d2h_bytes: batch.out_d2h_bytes,
+        ref_uploads: batch.ref_uploads,
+        resident_tiles: batch.resident_tiles,
+        resident_fallback_tiles: batch.resident_fallback_tiles,
+        resident_upload_ns: batch.resident_upload_ns,
+        resident_upload_bytes: batch.resident_upload_bytes,
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn stream_hv_ani_gpu_multi(
     writer: &mut BufWriter<File>,
     pb: &indicatif::ProgressBar,
@@ -496,6 +620,7 @@ fn stream_hv_ani_gpu_multi(
     ksize: u8,
     if_symmetric: bool,
     ani_threshold: f32,
+    threads: usize,
 ) -> anyhow::Result<usize> {
     if ref_filesketch.is_empty() || query_filesketch.is_empty() {
         return Ok(0);
@@ -530,15 +655,72 @@ fn stream_hv_ani_gpu_multi(
     }
 
     let total_jobs = jobs.len();
+    let postprocess_workers = (threads / 8).clamp(2, 8).min(total_jobs);
+    let work_queue_capacity = postprocess_workers * 2;
+    let result_queue_capacity = 64usize;
+    info!(
+        "Using {} postprocess worker(s) for tiled ANI formatting; Patch 4 timings imply 2 workers can roughly keep up with one local GPU, with 4-8 providing headroom",
+        postprocess_workers
+    );
+
     let jobs = Arc::new(jobs);
     let next = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = mpsc::channel::<anyhow::Result<TileBatchResult>>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let gpu_send_blocked_ns = Arc::new(AtomicU64::new(0));
+    let postprocess_result_send_blocked_ns = Arc::new(AtomicU64::new(0));
+    let (work_tx, work_rx) = channel::bounded::<DotTileBatch>(work_queue_capacity);
+    let (result_tx, result_rx) = channel::bounded::<GpuPipelineMessage>(result_queue_capacity);
 
     std::thread::scope(|scope| -> anyhow::Result<usize> {
+        for _ in 0..postprocess_workers {
+            let work_rx = work_rx.clone();
+            let result_tx = result_tx.clone();
+            let cancel = Arc::clone(&cancel);
+            let postprocess_result_send_blocked_ns =
+                Arc::clone(&postprocess_result_send_blocked_ns);
+
+            scope.spawn(move || {
+                while let Ok(batch) = work_rx.recv() {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let result = postprocess_dot_tile_batch(
+                        batch,
+                        ref_filesketch,
+                        query_filesketch,
+                        ref_cards,
+                        query_cards,
+                        ksize,
+                        if_symmetric,
+                        ani_threshold,
+                    );
+
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let send_start = Instant::now();
+                    if result_tx
+                        .send(GpuPipelineMessage::Batch(Ok(result)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let blocked_ns = send_start.elapsed().as_nanos();
+                    postprocess_result_send_blocked_ns
+                        .fetch_add(blocked_ns.min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                }
+            });
+        }
+
         for dev_id in 0..ng {
-            let tx = tx.clone();
+            let work_tx = work_tx.clone();
+            let result_tx = result_tx.clone();
             let jobs = Arc::clone(&jobs);
             let next = Arc::clone(&next);
+            let cancel = Arc::clone(&cancel);
+            let gpu_send_blocked_ns = Arc::clone(&gpu_send_blocked_ns);
             let resident_flat_host = resident_flat_host;
 
             scope.spawn(move || {
@@ -603,6 +785,10 @@ fn stream_hv_ani_gpu_multi(
                     let mut cached_nr = 0usize;
 
                     loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+
                         let job_idx = next.fetch_add(1, Ordering::Relaxed);
                         if job_idx >= jobs.len() {
                             break;
@@ -660,64 +846,32 @@ fn stream_hv_ani_gpu_multi(
                             )?
                         };
 
-                        let postprocess_start = Instant::now();
-                        let mut text = String::new();
-                        let mut num_hits = 0usize;
-                        let mut num_pairs_done = 0usize;
-                        let mut ani_evals = 0usize;
-                        let mut nonpositive_skipped = 0usize;
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
 
-                        for q_local in 0..nq {
-                            for r_local in 0..nr {
-                                let i = job.i0 + r_local;
-                                let j = job.j0 + q_local;
-
-                                if if_symmetric && i >= j {
-                                    continue;
-                                }
-
-                                num_pairs_done += 1;
-
-                                let dot = tile_dots[q_local * nr + r_local] as f64;
-                                let inter_hat = dot / hv_d as f64;
-                                if inter_hat <= 0.0 && ani_threshold > 0.0 {
-                                    nonpositive_skipped += 1;
-                                    continue;
-                                }
-
-                                ani_evals += 1;
-                                let ani = ani_from_intersection_and_cardinalities(
-                                    inter_hat,
-                                    ref_cards[i],
-                                    query_cards[j],
-                                    ksize,
-                                );
-
-                                if ani >= ani_threshold {
-                                    use std::fmt::Write as _;
-                                    let _ = writeln!(
-                                        &mut text,
-                                        "{}\t{}\t{:.3}",
-                                        ref_filesketch[i].file_str,
-                                        query_filesketch[j].file_str,
-                                        ani
-                                    );
-                                    num_hits += 1;
+                        let num_pairs_done = if if_symmetric {
+                            let mut count = 0usize;
+                            for q_local in 0..nq {
+                                for r_local in 0..nr {
+                                    if job.i0 + r_local < job.j0 + q_local {
+                                        count += 1;
+                                    }
                                 }
                             }
-                        }
-                        let postprocess_ns = postprocess_start.elapsed().as_nanos();
-                        let text_bytes = text.len();
+                            count
+                        } else {
+                            nq * nr
+                        };
 
-                        let _ = tx.send(Ok(TileBatchResult {
-                            text,
-                            num_hits,
+                        let batch = DotTileBatch {
+                            job,
+                            nq,
+                            nr,
+                            tile_dots,
                             num_pairs_done,
                             candidate_pairs: num_pairs_done,
                             prefilter_skipped: 0,
-                            ani_evals,
-                            nonpositive_skipped,
-                            text_bytes,
                             ref_flatten_events,
                             flatten_ref_ns,
                             flatten_query_ns,
@@ -725,7 +879,6 @@ fn stream_hv_ani_gpu_multi(
                             ref_h2d_ns: gpu_timings.ref_h2d_ns,
                             compute_d2h_ns: gpu_timings.compute_d2h_ns,
                             gpu_tile_total_ns: gpu_timings.total_ns,
-                            postprocess_ns,
                             query_h2d_bytes: gpu_timings.query_h2d_bytes,
                             ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
                             out_d2h_bytes: gpu_timings.out_d2h_bytes,
@@ -736,19 +889,38 @@ fn stream_hv_ani_gpu_multi(
                             resident_upload_bytes: std::mem::take(
                                 &mut resident_upload_bytes_pending,
                             ),
-                        }));
+                        };
+
+                        let send_start = Instant::now();
+                        match work_tx.send(batch) {
+                            Ok(()) => {
+                                let blocked_ns = send_start.elapsed().as_nanos();
+                                gpu_send_blocked_ns.fetch_add(
+                                    blocked_ns.min(u64::MAX as u128) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            Err(_) if cancel.load(Ordering::Relaxed) => break,
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "postprocess work queue closed unexpectedly: {e}"
+                                ));
+                            }
+                        }
                     }
 
                     Ok(())
                 };
 
                 if let Err(e) = worker() {
-                    let _ = tx.send(Err(e));
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = result_tx.send(GpuPipelineMessage::Batch(Err(e)));
                 }
             });
         }
 
-        drop(tx);
+        drop(work_tx);
+        drop(result_tx);
 
         let mut total_hits = 0usize;
         let mut received_jobs = 0usize;
@@ -757,9 +929,9 @@ fn stream_hv_ani_gpu_multi(
         let mut breakdown = GpuStreamBreakdown::default();
         breakdown.resident_flatten_ns = resident_flatten_ns;
 
-        while received_jobs < total_jobs {
-            match rx.recv() {
-                Ok(Ok(batch)) => {
+        while let Ok(message) = result_rx.recv() {
+            match message {
+                GpuPipelineMessage::Batch(Ok(batch)) => {
                     received_jobs += 1;
                     let write_start = Instant::now();
                     writer
@@ -770,22 +942,32 @@ fn stream_hv_ani_gpu_multi(
                     pb.inc(batch.num_pairs_done as u64);
                     breakdown.add_batch(&batch);
                 }
-                Ok(Err(e)) => {
+                GpuPipelineMessage::Batch(Err(e)) => {
+                    cancel.store(true, Ordering::Relaxed);
                     first_error.get_or_insert(e);
                 }
-                Err(e) => {
-                    first_error.get_or_insert_with(|| {
-                        anyhow::anyhow!("GPU worker channel closed unexpectedly: {e}")
-                    });
-                    break;
-                }
             }
+        }
+        breakdown.gpu_send_blocked_ns = gpu_send_blocked_ns.load(Ordering::Relaxed) as u128;
+        breakdown.postprocess_result_send_blocked_ns =
+            postprocess_result_send_blocked_ns.load(Ordering::Relaxed) as u128;
+
+        if received_jobs < total_jobs && first_error.is_none() {
+            first_error = Some(anyhow::anyhow!(
+                "GPU pipeline closed before all tile results were written: received_jobs={} total_jobs={}",
+                received_jobs,
+                total_jobs
+            ));
+        }
+
+        if first_error.is_some() {
+            cancel.store(true, Ordering::Relaxed);
         }
 
         if let Some(e) = first_error {
             Err(e)
         } else {
-            // Worker timings are aggregate worker-sums; with multiple GPUs they can exceed wall.
+            // Worker timings are aggregate worker-sums; postprocess can exceed wall after pipelining.
             let resident_mode = if !if_symmetric {
                 "disabled"
             } else if breakdown.resident_tiles > 0 && breakdown.resident_fallback_tiles == 0 {
@@ -794,7 +976,7 @@ fn stream_hv_ani_gpu_multi(
                 "fallback"
             };
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
@@ -803,6 +985,7 @@ fn stream_hv_ani_gpu_multi(
                 breakdown.ani_evals,
                 breakdown.nonpositive_skipped,
                 resident_mode,
+                postprocess_workers,
                 breakdown.output_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.ref_flatten_events,
                 breakdown.ref_uploads,
@@ -818,7 +1001,9 @@ fn stream_hv_ani_gpu_multi(
                 ns_to_secs(breakdown.ref_h2d_ns),
                 ns_to_secs(breakdown.compute_d2h_ns),
                 ns_to_secs(breakdown.gpu_tile_total_ns),
+                ns_to_secs(breakdown.gpu_send_blocked_ns),
                 ns_to_secs(breakdown.postprocess_ns),
+                ns_to_secs(breakdown.postprocess_result_send_blocked_ns),
                 ns_to_secs(breakdown.write_ns),
                 stream_wall_start.elapsed().as_secs_f64(),
             );
@@ -868,6 +1053,39 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn test_dot_tile_batch(
+        job: super::GpuTileJob,
+        nq: usize,
+        nr: usize,
+        dots: Vec<i64>,
+    ) -> super::DotTileBatch {
+        super::DotTileBatch {
+            job,
+            nq,
+            nr,
+            tile_dots: dots,
+            num_pairs_done: nq * nr,
+            candidate_pairs: nq * nr,
+            prefilter_skipped: 0,
+            ref_flatten_events: 0,
+            flatten_ref_ns: 0,
+            flatten_query_ns: 0,
+            query_h2d_ns: 0,
+            ref_h2d_ns: 0,
+            compute_d2h_ns: 0,
+            gpu_tile_total_ns: 0,
+            query_h2d_bytes: 0,
+            ref_h2d_bytes: 0,
+            out_d2h_bytes: 0,
+            ref_uploads: 0,
+            resident_tiles: 0,
+            resident_fallback_tiles: 0,
+            resident_upload_ns: 0,
+            resident_upload_bytes: 0,
+        }
     }
 
     #[test]
@@ -925,6 +1143,102 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn gpu_postprocess_helper_symmetric_skips_diagonal_and_lower_triangle() {
+        let sketches = vec![
+            test_filesketch("s0", vec![1, 0, 0, 0]),
+            test_filesketch("s1", vec![0, 1, 0, 0]),
+            test_filesketch("s2", vec![1, 0, 0, 0]),
+        ];
+        let cards = vec![1.0, 1.0, 1.0];
+        let batch = test_dot_tile_batch(
+            super::GpuTileJob {
+                i0: 0,
+                i1: 3,
+                j0: 0,
+                j1: 3,
+            },
+            3,
+            3,
+            vec![4, 0, 4, 0, 4, 0, 4, 0, 4],
+        );
+
+        let result = super::postprocess_dot_tile_batch(
+            batch, &sketches, &sketches, &cards, &cards, 1, true, 0.0,
+        );
+
+        assert_eq!(result.num_pairs_done, 3);
+        assert_eq!(result.ani_evals, 3);
+        assert_eq!(
+            result.text.lines().collect::<HashSet<_>>(),
+            HashSet::from(["s0\ts1\t0.000", "s0\ts2\t100.000", "s1\ts2\t0.000"])
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_postprocess_helper_threshold_zero_keeps_zero_ani_rows() {
+        let refs = vec![test_filesketch("r0", vec![4, 0, 0, 0])];
+        let queries = vec![test_filesketch("q0", vec![0, 4, 0, 0])];
+        let cards = vec![100.0];
+        let batch = test_dot_tile_batch(
+            super::GpuTileJob {
+                i0: 0,
+                i1: 1,
+                j0: 0,
+                j1: 1,
+            },
+            1,
+            1,
+            vec![0],
+        );
+
+        let result = super::postprocess_dot_tile_batch(
+            batch, &refs, &queries, &cards, &cards, 1, false, 0.0,
+        );
+
+        assert_eq!(result.num_hits, 1);
+        assert_eq!(result.ani_evals, 1);
+        assert_eq!(result.nonpositive_skipped, 0);
+        assert_eq!(result.text, "r0\tq0\t0.000\n");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_postprocess_helper_positive_threshold_filters_and_counts() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 0, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let batch = test_dot_tile_batch(
+            super::GpuTileJob {
+                i0: 0,
+                i1: 2,
+                j0: 0,
+                j1: 2,
+            },
+            2,
+            2,
+            vec![360, 0, 0, 0],
+        );
+
+        let result = super::postprocess_dot_tile_batch(
+            batch, &refs, &queries, &cards, &cards, 1, false, 85.0,
+        );
+
+        assert_eq!(result.num_hits, 1);
+        assert_eq!(result.num_pairs_done, 4);
+        assert_eq!(result.ani_evals, 1);
+        assert_eq!(result.nonpositive_skipped, 3);
+        assert_eq!(result.text, "r0\tq0\t90.000\n");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn gpu_stream_ani_threshold_zero_keeps_zero_ani_rows() {
         let refs = vec![
             test_filesketch("r0", vec![4, 0, 0, 0]),
@@ -949,6 +1263,7 @@ mod tests {
             1,
             false,
             0.0,
+            1,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -993,6 +1308,7 @@ mod tests {
             1,
             false,
             85.0,
+            1,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -1029,6 +1345,7 @@ mod tests {
             1,
             true,
             0.0,
+            1,
         )
         .expect("GPU symmetric stream should compute");
         writer.flush().expect("failed to flush output");
@@ -1105,6 +1422,7 @@ pub fn compute_hv_ani(
             ksize,
             if_symmetric,
             sketch_dist.ani_threshold,
+            sketch_dist.threads as usize,
         ) {
             Ok(n) => {
                 let flush_start = Instant::now();
