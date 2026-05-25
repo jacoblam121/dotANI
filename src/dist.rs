@@ -293,6 +293,8 @@ fn stream_hv_ani_cpu(
         File::create(out_path).expect("Failed to create ANI output file"),
     )));
     let total_hits = AtomicUsize::new(0);
+    let total_ani_evals = AtomicUsize::new(0);
+    let total_nonpositive_skipped = AtomicUsize::new(0);
 
     let row_starts: Vec<usize> = (0..ref_filesketch.len()).step_by(ROW_BLOCK).collect();
 
@@ -302,6 +304,8 @@ fn stream_hv_ani_cpu(
         let mut local_text = String::with_capacity(1 << 20);
         let mut local_hits = 0usize;
         let mut local_pairs_done = 0usize;
+        let mut local_ani_evals = 0usize;
+        let mut local_nonpositive_skipped = 0usize;
 
         for i in i0..i1 {
             let j_start = if if_symmetric { i + 1 } else { 0 };
@@ -312,6 +316,13 @@ fn stream_hv_ani_cpu(
 
                 let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
                 let inter_hat = dot / r.hv_d as f64;
+                if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                    local_nonpositive_skipped += 1;
+                    local_pairs_done += 1;
+                    continue;
+                }
+
+                local_ani_evals += 1;
                 let ani = ani_from_intersection_and_cardinalities(
                     inter_hat,
                     ref_cards[i],
@@ -349,6 +360,8 @@ fn stream_hv_ani_cpu(
         }
 
         total_hits.fetch_add(local_hits, Ordering::Relaxed);
+        total_ani_evals.fetch_add(local_ani_evals, Ordering::Relaxed);
+        total_nonpositive_skipped.fetch_add(local_nonpositive_skipped, Ordering::Relaxed);
         pb.inc(local_pairs_done as u64);
     });
 
@@ -357,6 +370,13 @@ fn stream_hv_ani_cpu(
         .expect("ANI writer mutex poisoned")
         .flush()
         .expect("Failed to flush ANI output");
+
+    info!(
+        "cpu stream breakdown: hits={} ani_evals={} nonpositive_skipped={}",
+        total_hits.load(Ordering::Relaxed),
+        total_ani_evals.load(Ordering::Relaxed),
+        total_nonpositive_skipped.load(Ordering::Relaxed)
+    );
 
     total_hits.load(Ordering::Relaxed)
 }
@@ -377,12 +397,21 @@ struct TileBatchResult {
     num_pairs_done: usize,
     candidate_pairs: usize,
     prefilter_skipped: usize,
+    ani_evals: usize,
+    nonpositive_skipped: usize,
     text_bytes: usize,
     ref_flatten_events: usize,
     flatten_ref_ns: u128,
     flatten_query_ns: u128,
-    gpu_tile_ns: u128,
+    query_h2d_ns: u128,
+    ref_h2d_ns: u128,
+    compute_d2h_ns: u128,
+    gpu_tile_total_ns: u128,
     postprocess_ns: u128,
+    query_h2d_bytes: usize,
+    ref_h2d_bytes: usize,
+    out_d2h_bytes: usize,
+    ref_uploads: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -393,13 +422,22 @@ struct GpuStreamBreakdown {
     hits: usize,
     candidates: usize,
     prefilter_skipped: usize,
+    ani_evals: usize,
+    nonpositive_skipped: usize,
     output_bytes: usize,
     ref_flatten_events: usize,
     flatten_ref_ns: u128,
     flatten_query_ns: u128,
-    gpu_tile_ns: u128,
+    query_h2d_ns: u128,
+    ref_h2d_ns: u128,
+    compute_d2h_ns: u128,
+    gpu_tile_total_ns: u128,
     postprocess_ns: u128,
     write_ns: u128,
+    query_h2d_bytes: usize,
+    ref_h2d_bytes: usize,
+    out_d2h_bytes: usize,
+    ref_uploads: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -410,12 +448,21 @@ impl GpuStreamBreakdown {
         self.hits += batch.num_hits;
         self.candidates += batch.candidate_pairs;
         self.prefilter_skipped += batch.prefilter_skipped;
+        self.ani_evals += batch.ani_evals;
+        self.nonpositive_skipped += batch.nonpositive_skipped;
         self.output_bytes += batch.text_bytes;
         self.ref_flatten_events += batch.ref_flatten_events;
         self.flatten_ref_ns += batch.flatten_ref_ns;
         self.flatten_query_ns += batch.flatten_query_ns;
-        self.gpu_tile_ns += batch.gpu_tile_ns;
+        self.query_h2d_ns += batch.query_h2d_ns;
+        self.ref_h2d_ns += batch.ref_h2d_ns;
+        self.compute_d2h_ns += batch.compute_d2h_ns;
+        self.gpu_tile_total_ns += batch.gpu_tile_total_ns;
         self.postprocess_ns += batch.postprocess_ns;
+        self.query_h2d_bytes += batch.query_h2d_bytes;
+        self.ref_h2d_bytes += batch.ref_h2d_bytes;
+        self.out_d2h_bytes += batch.out_d2h_bytes;
+        self.ref_uploads += batch.ref_uploads;
     }
 }
 
@@ -508,21 +555,22 @@ fn stream_hv_ani_gpu_multi(
                         let flatten_query_ns = flatten_query_start.elapsed().as_nanos();
 
                         let mut tile_dots = vec![0i64; nq * cached_nr];
-                        let gpu_tile_start = Instant::now();
-                        gpu.compute_tile(
+                        let gpu_timings = gpu.compute_tile(
                             &query_flat,
                             nq,
                             &cached_ref_flat,
                             cached_nr,
                             hv_d,
                             &mut tile_dots,
+                            ref_flatten_events > 0,
                         )?;
-                        let gpu_tile_ns = gpu_tile_start.elapsed().as_nanos();
 
                         let postprocess_start = Instant::now();
                         let mut text = String::new();
                         let mut num_hits = 0usize;
                         let mut num_pairs_done = 0usize;
+                        let mut ani_evals = 0usize;
+                        let mut nonpositive_skipped = 0usize;
 
                         for q_local in 0..nq {
                             for r_local in 0..cached_nr {
@@ -537,6 +585,12 @@ fn stream_hv_ani_gpu_multi(
 
                                 let dot = tile_dots[q_local * cached_nr + r_local] as f64;
                                 let inter_hat = dot / hv_d as f64;
+                                if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                                    nonpositive_skipped += 1;
+                                    continue;
+                                }
+
+                                ani_evals += 1;
                                 let ani = ani_from_intersection_and_cardinalities(
                                     inter_hat,
                                     ref_cards[i],
@@ -566,12 +620,21 @@ fn stream_hv_ani_gpu_multi(
                             num_pairs_done,
                             candidate_pairs: num_pairs_done,
                             prefilter_skipped: 0,
+                            ani_evals,
+                            nonpositive_skipped,
                             text_bytes,
                             ref_flatten_events,
                             flatten_ref_ns,
                             flatten_query_ns,
-                            gpu_tile_ns,
+                            query_h2d_ns: gpu_timings.query_h2d_ns,
+                            ref_h2d_ns: gpu_timings.ref_h2d_ns,
+                            compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                            gpu_tile_total_ns: gpu_timings.total_ns,
                             postprocess_ns,
+                            query_h2d_bytes: gpu_timings.query_h2d_bytes,
+                            ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
+                            out_d2h_bytes: gpu_timings.out_d2h_bytes,
+                            ref_uploads: usize::from(gpu_timings.ref_upload_performed),
                         }));
                     }
 
@@ -622,17 +685,26 @@ fn stream_hv_ani_gpu_multi(
         } else {
             // Worker timings are aggregate worker-sums; with multiple GPUs they can exceed wall.
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} output_mb={:.3} ref_flatten_events={} flatten_ref_cache_miss={:.3}s flatten_query={:.3}s gpu_tile={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} output_mb={:.3} ref_flatten_events={} ref_uploads={} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
                 breakdown.candidates,
                 breakdown.prefilter_skipped,
+                breakdown.ani_evals,
+                breakdown.nonpositive_skipped,
                 breakdown.output_bytes as f64 / (1024.0 * 1024.0),
                 breakdown.ref_flatten_events,
+                breakdown.ref_uploads,
+                breakdown.query_h2d_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.ref_h2d_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.out_d2h_bytes as f64 / (1024.0 * 1024.0),
                 ns_to_secs(breakdown.flatten_ref_ns),
                 ns_to_secs(breakdown.flatten_query_ns),
-                ns_to_secs(breakdown.gpu_tile_ns),
+                ns_to_secs(breakdown.query_h2d_ns),
+                ns_to_secs(breakdown.ref_h2d_ns),
+                ns_to_secs(breakdown.compute_d2h_ns),
+                ns_to_secs(breakdown.gpu_tile_total_ns),
                 ns_to_secs(breakdown.postprocess_ns),
                 ns_to_secs(breakdown.write_ns),
                 stream_wall_start.elapsed().as_secs_f64(),
@@ -645,8 +717,14 @@ fn stream_hv_ani_gpu_multi(
 #[cfg(test)]
 mod tests {
     use super::stream_hv_ani_cpu;
+    #[cfg(feature = "cuda")]
+    use super::stream_hv_ani_gpu_multi;
     use crate::types::FileSketch;
     use std::collections::HashSet;
+    #[cfg(feature = "cuda")]
+    use std::fs::File;
+    #[cfg(feature = "cuda")]
+    use std::io::{BufWriter, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -723,6 +801,89 @@ mod tests {
         let pb = indicatif::ProgressBar::hidden();
 
         let hits = stream_hv_ani_cpu(&out, &pb, &refs, &queries, &cards, &cards, 1, false, 85.0);
+        assert_eq!(hits, 2);
+        assert_eq!(
+            read_rows_as_set(&out),
+            HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_stream_ani_threshold_zero_keeps_zero_ani_rows() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("gpu_threshold_zero");
+        let pb = indicatif::ProgressBar::hidden();
+        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+        let hits = stream_hv_ani_gpu_multi(
+            &mut writer,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            0.0,
+        )
+        .expect("GPU stream should compute");
+        writer.flush().expect("failed to flush output");
+
+        assert_eq!(hits, 4);
+        assert_eq!(
+            read_rows_as_set(&out),
+            HashSet::from([
+                "r0\tq0\t90.000".to_string(),
+                "r0\tq1\t0.000".to_string(),
+                "r1\tq0\t0.000".to_string(),
+                "r1\tq1\t90.000".to_string(),
+            ])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_stream_normal_threshold_matches_expected_rows_as_set() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("gpu_threshold_85");
+        let pb = indicatif::ProgressBar::hidden();
+        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+        let hits = stream_hv_ani_gpu_multi(
+            &mut writer,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+        )
+        .expect("GPU stream should compute");
+        writer.flush().expect("failed to flush output");
+
         assert_eq!(hits, 2);
         assert_eq!(
             read_rows_as_set(&out),
