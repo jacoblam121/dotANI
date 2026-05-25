@@ -1,4 +1,4 @@
-use needletail::{parse_fastx_file, Sequence};
+use needletail::{Sequence, parse_fastx_file};
 use std::path::PathBuf;
 
 // Read merged sequences from a genome file into single u8 vector

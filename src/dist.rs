@@ -19,7 +19,7 @@ use std::time::Instant;
 use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
-use crate::cuda_dot::{device_count, GpuDotExecutor};
+use crate::cuda_dot::{GpuDotExecutor, device_count};
 
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
@@ -375,6 +375,54 @@ struct TileBatchResult {
     text: String,
     num_hits: usize,
     num_pairs_done: usize,
+    candidate_pairs: usize,
+    prefilter_skipped: usize,
+    text_bytes: usize,
+    ref_flatten_events: usize,
+    flatten_ref_ns: u128,
+    flatten_query_ns: u128,
+    gpu_tile_ns: u128,
+    postprocess_ns: u128,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct GpuStreamBreakdown {
+    jobs: usize,
+    pairs: usize,
+    hits: usize,
+    candidates: usize,
+    prefilter_skipped: usize,
+    output_bytes: usize,
+    ref_flatten_events: usize,
+    flatten_ref_ns: u128,
+    flatten_query_ns: u128,
+    gpu_tile_ns: u128,
+    postprocess_ns: u128,
+    write_ns: u128,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuStreamBreakdown {
+    fn add_batch(&mut self, batch: &TileBatchResult) {
+        self.jobs += 1;
+        self.pairs += batch.num_pairs_done;
+        self.hits += batch.num_hits;
+        self.candidates += batch.candidate_pairs;
+        self.prefilter_skipped += batch.prefilter_skipped;
+        self.output_bytes += batch.text_bytes;
+        self.ref_flatten_events += batch.ref_flatten_events;
+        self.flatten_ref_ns += batch.flatten_ref_ns;
+        self.flatten_query_ns += batch.flatten_query_ns;
+        self.gpu_tile_ns += batch.gpu_tile_ns;
+        self.postprocess_ns += batch.postprocess_ns;
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn ns_to_secs(ns: u128) -> f64 {
+    ns as f64 / 1_000_000_000.0
 }
 
 #[cfg(feature = "cuda")]
@@ -439,20 +487,28 @@ fn stream_hv_ani_gpu_multi(
 
                         let job = jobs[job_idx];
 
+                        let mut flatten_ref_ns = 0u128;
+                        let mut ref_flatten_events = 0usize;
                         if job.i0 != cached_i0 || job.i1 != cached_i1 {
                             cached_i0 = job.i0;
                             cached_i1 = job.i1;
 
                             let ref_block = &ref_filesketch[job.i0..job.i1];
                             cached_nr = ref_block.len();
+                            let flatten_ref_start = Instant::now();
                             cached_ref_flat = flatten_hv_matrix(ref_block);
+                            flatten_ref_ns = flatten_ref_start.elapsed().as_nanos();
+                            ref_flatten_events = 1;
                         }
 
                         let query_block = &query_filesketch[job.j0..job.j1];
                         let nq = query_block.len();
+                        let flatten_query_start = Instant::now();
                         let query_flat = flatten_hv_matrix(query_block);
+                        let flatten_query_ns = flatten_query_start.elapsed().as_nanos();
 
                         let mut tile_dots = vec![0i64; nq * cached_nr];
+                        let gpu_tile_start = Instant::now();
                         gpu.compute_tile(
                             &query_flat,
                             nq,
@@ -461,7 +517,9 @@ fn stream_hv_ani_gpu_multi(
                             hv_d,
                             &mut tile_dots,
                         )?;
+                        let gpu_tile_ns = gpu_tile_start.elapsed().as_nanos();
 
+                        let postprocess_start = Instant::now();
                         let mut text = String::new();
                         let mut num_hits = 0usize;
                         let mut num_pairs_done = 0usize;
@@ -499,11 +557,21 @@ fn stream_hv_ani_gpu_multi(
                                 }
                             }
                         }
+                        let postprocess_ns = postprocess_start.elapsed().as_nanos();
+                        let text_bytes = text.len();
 
                         let _ = tx.send(Ok(TileBatchResult {
                             text,
                             num_hits,
                             num_pairs_done,
+                            candidate_pairs: num_pairs_done,
+                            prefilter_skipped: 0,
+                            text_bytes,
+                            ref_flatten_events,
+                            flatten_ref_ns,
+                            flatten_query_ns,
+                            gpu_tile_ns,
+                            postprocess_ns,
                         }));
                     }
 
@@ -521,16 +589,21 @@ fn stream_hv_ani_gpu_multi(
         let mut total_hits = 0usize;
         let mut received_jobs = 0usize;
         let mut first_error = None;
+        let stream_wall_start = Instant::now();
+        let mut breakdown = GpuStreamBreakdown::default();
 
         while received_jobs < total_jobs {
             match rx.recv() {
                 Ok(Ok(batch)) => {
                     received_jobs += 1;
+                    let write_start = Instant::now();
                     writer
                         .write_all(batch.text.as_bytes())
                         .expect("Failed to write ANI batch");
+                    breakdown.write_ns += write_start.elapsed().as_nanos();
                     total_hits += batch.num_hits;
                     pb.inc(batch.num_pairs_done as u64);
+                    breakdown.add_batch(&batch);
                 }
                 Ok(Err(e)) => {
                     first_error.get_or_insert(e);
@@ -547,9 +620,117 @@ fn stream_hv_ani_gpu_multi(
         if let Some(e) = first_error {
             Err(e)
         } else {
+            // Worker timings are aggregate worker-sums; with multiple GPUs they can exceed wall.
+            info!(
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} output_mb={:.3} ref_flatten_events={} flatten_ref_cache_miss={:.3}s flatten_query={:.3}s gpu_tile={:.3}s postprocess={:.3}s write={:.3}s wall={:.3}s",
+                breakdown.jobs,
+                breakdown.pairs,
+                breakdown.hits,
+                breakdown.candidates,
+                breakdown.prefilter_skipped,
+                breakdown.output_bytes as f64 / (1024.0 * 1024.0),
+                breakdown.ref_flatten_events,
+                ns_to_secs(breakdown.flatten_ref_ns),
+                ns_to_secs(breakdown.flatten_query_ns),
+                ns_to_secs(breakdown.gpu_tile_ns),
+                ns_to_secs(breakdown.postprocess_ns),
+                ns_to_secs(breakdown.write_ns),
+                stream_wall_start.elapsed().as_secs_f64(),
+            );
             Ok(total_hits)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_hv_ani_cpu;
+    use crate::types::FileSketch;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_ani_path(label: &str) -> PathBuf {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("dotani_{label}_{}_{}.ani", std::process::id(), id))
+    }
+
+    fn test_filesketch(file_str: &str, hv: Vec<i32>) -> FileSketch {
+        FileSketch {
+            ksize: 1,
+            scaled: 1,
+            canonical: true,
+            seed: 123,
+            hv_d: hv.len(),
+            hv_quant_bits: 0,
+            hv_norm_2: 0,
+            file_str: file_str.to_string(),
+            hv,
+        }
+    }
+
+    fn read_rows_as_set(path: &std::path::Path) -> HashSet<String> {
+        std::fs::read_to_string(path)
+            .expect("failed to read ANI output")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn cpu_stream_ani_threshold_zero_keeps_zero_ani_rows() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("threshold_zero");
+        let pb = indicatif::ProgressBar::hidden();
+
+        let hits = stream_hv_ani_cpu(&out, &pb, &refs, &queries, &cards, &cards, 1, false, 0.0);
+        assert_eq!(hits, 4);
+        assert_eq!(
+            read_rows_as_set(&out),
+            HashSet::from([
+                "r0\tq0\t90.000".to_string(),
+                "r0\tq1\t0.000".to_string(),
+                "r1\tq0\t0.000".to_string(),
+                "r1\tq1\t90.000".to_string(),
+            ])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn cpu_stream_normal_threshold_matches_expected_rows_as_set() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("threshold_85");
+        let pb = indicatif::ProgressBar::hidden();
+
+        let hits = stream_hv_ani_cpu(&out, &pb, &refs, &queries, &cards, &cards, 1, false, 85.0);
+        assert_eq!(hits, 2);
+        assert_eq!(
+            read_rows_as_set(&out),
+            HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
 }
 
 pub fn compute_hv_ani(
