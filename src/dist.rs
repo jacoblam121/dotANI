@@ -674,7 +674,7 @@ fn stream_hv_ani_gpu_multi(
     let work_queue_capacity = postprocess_workers * 2;
     let result_queue_capacity = 64usize;
     info!(
-        "Using {} postprocess worker(s) for tiled ANI formatting; Patch 4 timings imply 2 workers can roughly keep up with one local GPU, with 4-8 providing headroom",
+        "Using {} postprocess worker(s) for tiled ANI formatting",
         postprocess_workers
     );
 
