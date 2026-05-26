@@ -407,11 +407,14 @@ struct DotTileBatch {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
     ref_uploads: usize,
+    event_timed_tiles: usize,
     resident_tiles: usize,
     resident_fallback_tiles: usize,
     resident_upload_ns: u128,
@@ -434,12 +437,15 @@ struct TileBatchResult {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
     postprocess_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
     ref_uploads: usize,
+    event_timed_tiles: usize,
     resident_tiles: usize,
     resident_fallback_tiles: usize,
     resident_upload_ns: u128,
@@ -463,6 +469,8 @@ struct GpuStreamBreakdown {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
     postprocess_ns: u128,
     gpu_send_blocked_ns: u128,
@@ -472,6 +480,7 @@ struct GpuStreamBreakdown {
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
     ref_uploads: usize,
+    event_timed_tiles: usize,
     resident_tiles: usize,
     resident_fallback_tiles: usize,
     resident_flatten_ns: u128,
@@ -496,12 +505,15 @@ impl GpuStreamBreakdown {
         self.query_h2d_ns += batch.query_h2d_ns;
         self.ref_h2d_ns += batch.ref_h2d_ns;
         self.compute_d2h_ns += batch.compute_d2h_ns;
+        self.kernel_event_ns += batch.kernel_event_ns;
+        self.d2h_event_ns += batch.d2h_event_ns;
         self.gpu_tile_total_ns += batch.gpu_tile_total_ns;
         self.postprocess_ns += batch.postprocess_ns;
         self.query_h2d_bytes += batch.query_h2d_bytes;
         self.ref_h2d_bytes += batch.ref_h2d_bytes;
         self.out_d2h_bytes += batch.out_d2h_bytes;
         self.ref_uploads += batch.ref_uploads;
+        self.event_timed_tiles += batch.event_timed_tiles;
         self.resident_tiles += batch.resident_tiles;
         self.resident_fallback_tiles += batch.resident_fallback_tiles;
         self.resident_upload_ns += batch.resident_upload_ns;
@@ -596,12 +608,15 @@ fn postprocess_dot_tile_batch(
         query_h2d_ns: batch.query_h2d_ns,
         ref_h2d_ns: batch.ref_h2d_ns,
         compute_d2h_ns: batch.compute_d2h_ns,
+        kernel_event_ns: batch.kernel_event_ns,
+        d2h_event_ns: batch.d2h_event_ns,
         gpu_tile_total_ns: batch.gpu_tile_total_ns,
         postprocess_ns,
         query_h2d_bytes: batch.query_h2d_bytes,
         ref_h2d_bytes: batch.ref_h2d_bytes,
         out_d2h_bytes: batch.out_d2h_bytes,
         ref_uploads: batch.ref_uploads,
+        event_timed_tiles: batch.event_timed_tiles,
         resident_tiles: batch.resident_tiles,
         resident_fallback_tiles: batch.resident_fallback_tiles,
         resident_upload_ns: batch.resident_upload_ns,
@@ -878,11 +893,14 @@ fn stream_hv_ani_gpu_multi(
                             query_h2d_ns: gpu_timings.query_h2d_ns,
                             ref_h2d_ns: gpu_timings.ref_h2d_ns,
                             compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                            kernel_event_ns: gpu_timings.kernel_event_ns,
+                            d2h_event_ns: gpu_timings.d2h_event_ns,
                             gpu_tile_total_ns: gpu_timings.total_ns,
                             query_h2d_bytes: gpu_timings.query_h2d_bytes,
                             ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
                             out_d2h_bytes: gpu_timings.out_d2h_bytes,
                             ref_uploads: usize::from(gpu_timings.ref_upload_performed),
+                            event_timed_tiles: gpu_timings.event_timed_tiles,
                             resident_tiles,
                             resident_fallback_tiles,
                             resident_upload_ns: std::mem::take(&mut resident_upload_ns_pending),
@@ -975,8 +993,12 @@ fn stream_hv_ani_gpu_multi(
             } else {
                 "fallback"
             };
+            let compute_unattributed_ns = breakdown
+                .compute_d2h_ns
+                .saturating_sub(breakdown.kernel_event_ns)
+                .saturating_sub(breakdown.d2h_event_ns);
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s kernel_event={:.3}s d2h_event={:.3}s compute_unattributed={:.3}s event_timed_tiles={} gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
@@ -1000,6 +1022,10 @@ fn stream_hv_ani_gpu_multi(
                 ns_to_secs(breakdown.query_h2d_ns),
                 ns_to_secs(breakdown.ref_h2d_ns),
                 ns_to_secs(breakdown.compute_d2h_ns),
+                ns_to_secs(breakdown.kernel_event_ns),
+                ns_to_secs(breakdown.d2h_event_ns),
+                ns_to_secs(compute_unattributed_ns),
+                breakdown.event_timed_tiles,
                 ns_to_secs(breakdown.gpu_tile_total_ns),
                 ns_to_secs(breakdown.gpu_send_blocked_ns),
                 ns_to_secs(breakdown.postprocess_ns),
@@ -1076,11 +1102,14 @@ mod tests {
             query_h2d_ns: 0,
             ref_h2d_ns: 0,
             compute_d2h_ns: 0,
+            kernel_event_ns: 0,
+            d2h_event_ns: 0,
             gpu_tile_total_ns: 0,
             query_h2d_bytes: 0,
             ref_h2d_bytes: 0,
             out_d2h_bytes: 0,
             ref_uploads: 0,
+            event_timed_tiles: 0,
             resident_tiles: 0,
             resident_fallback_tiles: 0,
             resident_upload_ns: 0,
