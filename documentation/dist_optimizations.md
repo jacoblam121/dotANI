@@ -2,16 +2,18 @@
 
 ## High Level
 
-- Dist speedup of ~4.4x on Russell (single GPU, other GPUs were busy) and ~3.8x on local
+- Dist speedup of ~4.5x on Russell (single GPU, other GPUs were busy) and ~3.8x on local (internal timing)
 - .ani outputs are preserved as an unordered row set; raw row order can change (will explain, but at a high level we are able to implement pipelining/scheduling on GPU which gave us a bulk of our speedup)
 - GTDB ~113k validated with identical sorted SHA 256
-- Accuracy test retained byte identical result (Claire's notebook)
+- Accuracy test retained identical result (Claire's notebook)
 
-| Machine | Baseline | Optimized | Speedup |
-| --- | ---: | ---: | ---: |
-| Russell single GPU run 1 | `98.663s` | `22.434s` | `4.40x` |
-| Russell single GPU run 2 | `101.666s` | `22.531s` | `4.51x` |
-| Local (median of 3 runs) | `209.170s` | `54.913s` | `3.81x` |
+NOTE: Just discovered that local wall clock (was fine on Russell) is not accurate for some reason, as something probably went wrong with the system clock when doing these runs. Writeup here uses internal dist_total_s instead, will rerun later. 
+
+| Machine | Baseline | Optimized | Speedup | Timing source |
+| --- | ---: | ---: | ---: | --- |
+| Russell single GPU run 1 | 104.58s | 23.50s | 4.45x | wall clock |
+| Russell single GPU run 2 | 103.78s | 23.11s | 4.49x | wall clock |
+| Local (median of 3 runs) | 209.170s | 54.913s | 3.81x | dist_total_s |
 
 ## Timing
 
@@ -44,9 +46,11 @@ Run 2:
 vs baseline:
 
 Run 1:
+wall speedup = 104.58 / 23.50 = 4.45x
 dist total speedup = 98.663 / 22.434 = 4.40x
 stream speedup     = 93.235 / 16.964 = 5.50x
 Run 2:
+wall speedup = 103.78 / 23.11 = 4.49x
 dist total speedup = 101.666 / 22.531 = 4.51x
 stream speedup     = 96.379 / 16.859 = 5.72x
 
@@ -56,18 +60,21 @@ Stream here is the main ANI computation phase, where dist goes through compariso
 
 Run on -T 128
 
+Note: no wall clock, these are internal timings only
+
 | `dist_total_s` | `stream_s` |
 | --- | ---: |
 | `15.702s` | `10.122s` |
 
 vs single gpu run:
+dist total speedup  = 22.434 / 15.702 = 1.43x
 stream speedup = 16.964 / 10.122 = 1.68x
-total speedup  = 22.434 / 15.702 = 1.43x
+
 
 ### Local
 
 Median of 3 runs:
-| Label | Elapsed | `dist_total_s` | `stream_s` |
+| Label | Wall (s) | `dist_total_s` | `stream_s` |
 | --- | ---: | ---: | ---: |
 | baseline | `203.000` | NA | NA |
 | progress timing | `192.670` | `209.170` | `190.333` |
@@ -75,6 +82,8 @@ Median of 3 runs:
 | ref H2D cache | `175.790` | `189.076` | `170.642` |
 | resident symmetric | `146.810` | `155.692` | `138.918` |
 | pipeline postprocess | `51.160` | `54.913` | `37.184` |
+
+As said before, something appears to be wrong with the wall clock here, it should not be shorter than `dist_total_s` 
 
 vs baseline:
 dist total speedup = 209.170 / 54.913 = 3.81x
@@ -123,7 +132,7 @@ After pipelining, this is separated: GPU workers can start later tiles while CPU
 Because tiles now finish independently though, output order of rows can be different, but row set and the actual ANI values are unchanged.\
 This is why the raw output is not byte identical anymore, but row order isn't actually important for the .ani result; when we sort the rows we get the same SHA256 hash.
 
-### 100k GTDB Row-Set Validation
+### 113k GTDB Row-Set Validation
 
 Rows were sorted and hashed with:
 ```text
@@ -179,7 +188,6 @@ Did work in phases; commit 6 is currently on experimental branch `dist_experimen
 | Commit 4 `2ff3694` | Resident symmetric matrix | Sorted row-set identical |
 | Commit 5 `51d08d6` | Pipeline postprocess | Sorted row-set identical |
 | Experimental Branch `d005f64` | CUDA event timing | Experimental branch only; not merged to `main` |
-|
 
 ### Progress and Timing
 
@@ -218,7 +226,7 @@ final filter = existing ani >= ani_threshold
 
 ### Reference Host to Device (CPU -> GPU) Cache
 
-- Reduced repeated host to deice uploads of reference tiles
+- Reduced repeated host to device uploads of reference tiles
 - Reference tiles in this context: for pairwise comparison; sketch 1 x sketch 2 -> reference x query
 - For a fixed reference tile, we compare to many query tiles, so we can use the same reference tile over again
 - Previously, we transferred the same tile to the GPU repeatedly, now reference tile is only uploaded to GPU on cache miss
@@ -250,7 +258,8 @@ New bottleneck picture:
 
 ### (GPU) Resident Symmetric Matrix
 
-"Resident" here means data stays in GPU memory; no transfers
+Resident here means data is transferred to GPU once and then stays in GPU memory for reuse, so the sketch matrix becomes resident on the GPU
+
 - Comparison in dist is self comparison, coming from the sketch file (reference sketch x query sketch)
 - Thus the reference and query sketches are the same matrix, and dist is just filling in a large pairwise ANI matrix when comparing the two
 - Because the matrix is symmetric, ANI(A, B) == ANI(B, A), so from matrix symmetry we know that we only have to compute the upper triangle of the matrix
@@ -333,7 +342,7 @@ This lets the GPU start computing later tiles while the CPU is working on earlie
 
 However, this does change raw output order. Since tiles now complete independently, rows can be written in a different order than the serial traversal. We can verify it's still correct by sorting the .ani rows and confirming the row sets are identical
 
-Also addded backpressure metrics (see if one stage of the pipeline is slowing down an earlier stage)
+Also added backpressure metrics (see if one stage of the pipeline is slowing down an earlier stage)
 
 | Metric | Means |
 | --- | --- |
@@ -367,7 +376,7 @@ So -T to postprocess workers are as follows:
 | `64` | `8` |
 | `128` | `8` |
 
-So even though local machine CPU only has 16 threads, we find the best peformance at `-T 48`. The GPU path is not using 48 CPU workers, rather it's using one GPU worker while 6 CPU workers deal with ANI/filter/format postprocess, plus the writer and setup work.
+So even though local machine CPU only has 16 threads, we find the best performance at `-T 48`. The GPU path is not using 48 CPU workers, rather it's using one GPU worker while 6 CPU workers deal with ANI/filter/format postprocess, plus the writer and setup work.
 
 Note: if `gpu_send_blocked` is low, increasing `-T` or postprocess workers probably is not going to give much further speedup
 
