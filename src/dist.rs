@@ -655,7 +655,7 @@ fn stream_hv_ani_gpu_multi(
     }
 
     let total_jobs = jobs.len();
-    let postprocess_workers = (threads / 8).clamp(2, 8).min(total_jobs);
+    let postprocess_workers = threads.clamp(2, 128).min(total_jobs);
     let work_queue_capacity = postprocess_workers * 2;
     let result_queue_capacity = 64usize;
     info!(
