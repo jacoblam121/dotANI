@@ -238,9 +238,9 @@ pub fn ani_from_intersection_and_cardinalities(
     if !jaccard.is_finite() || jaccard <= 0.0 {
         return 0.0;
     }
-    
+
     if jaccard > 1.0 {
-        return 100.0
+        return 100.0;
     }
 
     let ani = (2.0 * jaccard as f32 / (1.0 + jaccard as f32)).powf(1.0 / ksize as f32);
@@ -1018,9 +1018,9 @@ fn stream_hv_ani_gpu_multi(
 
 #[cfg(test)]
 mod tests {
-    use super::stream_hv_ani_cpu;
     #[cfg(feature = "cuda")]
     use super::stream_hv_ani_gpu_multi;
+    use super::{ani_from_intersection_and_cardinalities, stream_hv_ani_cpu};
     use crate::types::FileSketch;
     use std::collections::HashSet;
     #[cfg(feature = "cuda")]
@@ -1031,6 +1031,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn ani_clamps_estimated_jaccard_overshoot_to_100() {
+        let ani = ani_from_intersection_and_cardinalities(120.0, 100.0, 100.0, 16);
+        assert!(
+            (ani - 100.0).abs() < f32::EPSILON,
+            "expected overshot Jaccard estimate to produce 100 ANI, got {ani}"
+        );
+    }
 
     fn temp_ani_path(label: &str) -> PathBuf {
         let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
