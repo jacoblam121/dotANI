@@ -146,6 +146,7 @@ pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_
         summary.hashes_seen += metric.hashes_seen;
         summary.unique_hashes += metric.unique_hashes;
         summary.fasta_ns += metric.fasta_ns;
+        summary.fasta_wait_ns += metric.fasta_wait_ns;
         summary.hash_and_dedup_ns += metric.hash_and_dedup_ns;
         summary.hd_encode_ns += metric.hd_encode_ns;
         summary.hv_norm_ns += metric.hv_norm_ns;
@@ -195,17 +196,18 @@ fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
 }
 
 fn metrics_header() -> &'static str {
-    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
+    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\tfasta_wait_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
 }
 
 fn metric_row(metric: &FileSketchMetrics) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         metric.file,
         metric.input_bases,
         metric.hashes_seen,
         metric.unique_hashes,
         metric.fasta_ns,
+        metric.fasta_wait_ns,
         metric.hash_and_dedup_ns,
         metric.hd_encode_ns,
         metric.hv_norm_ns,

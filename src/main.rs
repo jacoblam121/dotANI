@@ -145,6 +145,13 @@ fn main() {
                 .help("Write sketch metrics to <prefix>.summary.tsv and <prefix>.files.tsv")
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("max_readers")
+                .long("max-readers")
+                .help("CUDA only: maximum concurrent FASTA read/decompress/merge workers")
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
         );
 
     let dist_cmd = Command::new(params::CMD_DIST)
@@ -253,9 +260,19 @@ fn main() {
             .get_one::<String>("device")
             .cloned()
             .unwrap_or_else(default_sketch_device);
+        let max_readers = sketch_m.get_one::<usize>("max_readers").copied();
+
+        if max_readers == Some(0) {
+            eprintln!("error: --max-readers must be greater than 0");
+            std::process::exit(2);
+        }
 
         if device == "cuda" && !cuda_enabled() {
             eprintln!("error: --device cuda requires a binary built with --features cuda");
+            std::process::exit(2);
+        }
+        if device == "cpu" && max_readers.is_some() {
+            eprintln!("error: --max-readers is only supported with --device cuda");
             std::process::exit(2);
         }
 
@@ -278,6 +295,7 @@ fn main() {
             cuda_dedup_strategy: types::CudaDedupStrategy::from_cli_value(
                 sketch_m.get_one::<String>("cuda_dedup").unwrap(),
             ),
+            max_readers,
             device,
             if_ull: true,
             ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
@@ -326,6 +344,7 @@ fn main() {
             if_compressed: true,
             threads,
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
+            max_readers: None,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,
@@ -368,6 +387,7 @@ fn main() {
             if_compressed: true,
             threads,
             cuda_dedup_strategy: types::CudaDedupStrategy::HashSet,
+            max_readers: None,
             device: String::from("cpu"),
             if_ull: true,
             ull_p: 0,

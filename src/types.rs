@@ -78,6 +78,7 @@ pub struct CliParams {
 
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -125,6 +126,7 @@ pub struct SketchParams {
     pub if_compressed: bool,
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -148,6 +150,7 @@ impl Default for SketchParams {
             if_compressed: true,
             threads: 1,
             cuda_dedup_strategy: CudaDedupStrategy::HashSet,
+            max_readers: None,
 
             if_ull: false,
             ull_p: 14,
@@ -173,6 +176,7 @@ impl SketchParams {
         new_sketch.if_compressed = params.if_compressed;
         new_sketch.threads = params.threads;
         new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
+        new_sketch.max_readers = params.max_readers;
 
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;
@@ -190,6 +194,7 @@ pub struct FileSketchMetrics {
     pub hashes_seen: usize,
     pub unique_hashes: usize,
     pub fasta_ns: u128,
+    pub fasta_wait_ns: u128,
     pub hash_and_dedup_ns: u128,
     pub hd_encode_ns: u128,
     pub hv_norm_ns: u128,

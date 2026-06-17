@@ -2,7 +2,7 @@ use crate::types::*;
 
 #[cfg(feature = "cuda")]
 use {
-    crate::{dist, fastx_reader, hd, hd_cuda, utils},
+    crate::{dist, fastx_reader, fastx_reader::ReaderGate, hd, hd_cuda, utils},
     anyhow::{Result, anyhow},
     cudarc::{
         driver::{
@@ -210,6 +210,10 @@ pub fn sketch_cuda(params: SketchParams) {
         "Using CUDA dedup strategy: {}",
         params.cuda_dedup_strategy.as_str()
     );
+    let reader_gate = params.max_readers.map(|limit| {
+        info!("Limiting concurrent FASTA readers to {}", limit);
+        Arc::new(ReaderGate::new(limit))
+    });
 
     let next_file = Arc::new(AtomicUsize::new(0));
     let stop_workers = Arc::new(AtomicBool::new(false));
@@ -224,6 +228,7 @@ pub fn sketch_cuda(params: SketchParams) {
             let params = &params;
             let next_file = Arc::clone(&next_file);
             let stop_workers = Arc::clone(&stop_workers);
+            let reader_gate = reader_gate.clone();
             let tx = tx.clone();
 
             scope.spawn(move || {
@@ -240,8 +245,13 @@ pub fn sketch_cuda(params: SketchParams) {
                             break;
                         }
 
-                        let result =
-                            sketch_one_file_cuda(index, &files[index], params, &mut scratch)?;
+                        let result = sketch_one_file_cuda(
+                            index,
+                            &files[index],
+                            params,
+                            reader_gate.as_ref(),
+                            &mut scratch,
+                        )?;
                         if tx.send(Ok(result)).is_err() {
                             break;
                         }
@@ -405,6 +415,7 @@ fn sketch_one_file_cuda(
     index: usize,
     file: &PathBuf,
     params: &SketchParams,
+    reader_gate: Option<&Arc<ReaderGate>>,
     scratch: &mut CudaSketchLaneScratch,
 ) -> Result<IndexedSketchResult> {
     let worker_start = Instant::now();
@@ -420,7 +431,7 @@ fn sketch_one_file_cuda(
         hv: Vec::<i32>::new(),
     };
 
-    let mut metrics = extract_kmer_t1ha2_cuda_full_hashes_into(&sketch, scratch)?;
+    let mut metrics = extract_kmer_t1ha2_cuda_full_hashes_into(&sketch, reader_gate, scratch)?;
     metrics.file = sketch.file_str.clone();
     metrics.hashes_seen = scratch.full_hashes.len();
 
@@ -548,19 +559,29 @@ fn sketch_one_file_cuda(
 #[cfg(feature = "cuda")]
 fn extract_kmer_t1ha2_cuda_full_hashes_into(
     sketch: &FileSketch,
+    reader_gate: Option<&Arc<ReaderGate>>,
     scratch: &mut CudaSketchLaneScratch,
 ) -> Result<FileSketchMetrics> {
     scratch.full_hashes.clear();
 
     let fna_file = PathBuf::from(sketch.file_str.clone());
+    let wait_start = Instant::now();
+    let permit = reader_gate.map(|gate| gate.acquire());
+    let fasta_wait_ns = if permit.is_some() {
+        wait_start.elapsed().as_nanos()
+    } else {
+        0
+    };
     let fasta_start = Instant::now();
     let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
     let fasta_ns = fasta_start.elapsed().as_nanos();
+    drop(permit);
 
     let n_bps = fna_seqs.len();
     let mut metrics = FileSketchMetrics {
         input_bases: n_bps,
         fasta_ns,
+        fasta_wait_ns,
         cuda_stream_lane: Some(scratch.lane_id),
         cuda_device_id: Some(scratch.dev_id),
         ..FileSketchMetrics::default()

@@ -407,9 +407,10 @@ mod tests {
 
         assert_eq!(rows.len(), 3);
         let header = &rows[0];
-        assert_eq!(header.len(), 24);
+        assert_eq!(header.len(), 25);
+        assert_eq!(header[5], "fasta_wait_ns");
         assert_eq!(
-            &header[19..],
+            &header[20..],
             &[
                 "cuda_hd_hash_h2d_ns",
                 "cuda_hd_hv_h2d_ns",
@@ -424,11 +425,11 @@ mod tests {
         assert_eq!(cpu_row.len(), header.len());
         assert_eq!(cuda_row.len(), header.len());
         assert_eq!(cpu_row[0], "cpu.fna");
-        assert_eq!(&cpu_row[11..], &["NA"; 13]);
+        assert_eq!(&cpu_row[11..], &["NA"; 14]);
         assert_eq!(cuda_row[0], "cuda.fna");
-        assert_eq!(&cuda_row[11..13], &["0", "2"]);
-        assert_eq!(&cuda_row[13..19], &["11", "22", "33", "44", "55", "66"]);
-        assert_eq!(&cuda_row[19..], &["NA"; 5]);
+        assert_eq!(&cuda_row[12..14], &["0", "2"]);
+        assert_eq!(&cuda_row[14..20], &["11", "22", "33", "44", "55", "66"]);
+        assert_eq!(&cuda_row[20..], &["NA"; 5]);
 
         let summary_tsv = fs::read_to_string(dir.join("metrics.summary.tsv")).unwrap();
         let summary_rows: Vec<Vec<&str>> = summary_tsv
@@ -436,12 +437,17 @@ mod tests {
             .map(|line| line.split('\t').collect())
             .collect();
         assert_eq!(summary_rows.len(), 2);
-        assert_eq!(summary_rows[0].len(), 24);
-        assert_eq!(summary_rows[1].len(), 24);
+        assert_eq!(summary_rows[0].len(), 25);
+        assert_eq!(summary_rows[1].len(), 25);
         assert_eq!(summary_rows[1][0], "TOTAL");
-        assert_eq!(summary_rows[1][11], "NA");
+        assert_eq!(summary_rows[1][11], "1234");
         assert_eq!(summary_rows[1][12], "NA");
-        assert_eq!(&summary_rows[1][19..], &["NA"; 5]);
+        assert_eq!(summary_rows[1][13], "NA");
+        assert_eq!(
+            &summary_rows[1][14..20],
+            &["11", "22", "33", "44", "55", "66"]
+        );
+        assert_eq!(&summary_rows[1][20..], &["NA"; 5]);
 
         fs::remove_dir_all(&dir).unwrap();
     }
