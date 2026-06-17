@@ -157,19 +157,20 @@ fn grow_capacity(current: usize, needed: usize) -> usize {
 
 #[allow(unused_variables)]
 #[cfg(not(feature = "cuda"))]
-pub fn sketch_cuda(params: SketchParams) {
+pub fn sketch_cuda(params: SketchParams) -> anyhow::Result<()> {
     use log::error;
 
     error!(
         "Cuda sketching is not supported. Please add `--features cuda-sketch` for installation to enable it."
     );
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "cuda"))]
-pub fn sketch_cuda(params: SketchParams) {
+pub fn sketch_cuda(params: SketchParams) -> Result<()> {
     let sketch_wall_start = Instant::now();
-    let files = utils::get_fasta_files(&params.path);
-    let n_file = files.len();
+    let inputs = utils::get_sketch_inputs(&params)?;
+    let n_file = inputs.len();
 
     info!("Start GPU sketching...");
     let pb = utils::get_progress_bar(n_file);
@@ -195,7 +196,7 @@ pub fn sketch_cuda(params: SketchParams) {
             );
         }
 
-        return;
+        return Ok(());
     }
 
     let device_ids =
@@ -224,7 +225,7 @@ pub fn sketch_cuda(params: SketchParams) {
     std::thread::scope(|scope| {
         for lane_id in 0..lane_count {
             let dev_id = device_ids[lane_id % device_ids.len()];
-            let files = &files;
+            let inputs = &inputs;
             let params = &params;
             let next_file = Arc::clone(&next_file);
             let stop_workers = Arc::clone(&stop_workers);
@@ -241,13 +242,13 @@ pub fn sketch_cuda(params: SketchParams) {
                         }
 
                         let index = next_file.fetch_add(1, Ordering::Relaxed);
-                        if index >= files.len() {
+                        if index >= inputs.len() {
                             break;
                         }
 
                         let result = sketch_one_file_cuda(
                             index,
-                            &files[index],
+                            &inputs[index],
                             params,
                             reader_gate.as_ref(),
                             &mut scratch,
@@ -317,7 +318,7 @@ pub fn sketch_cuda(params: SketchParams) {
 
     info!(
         "Sketching {} files took {:.2}s - Speed: {:.1} files/s",
-        files.len(),
+        inputs.len(),
         pb.elapsed().as_secs_f32(),
         pb.per_sec()
     );
@@ -331,6 +332,8 @@ pub fn sketch_cuda(params: SketchParams) {
     if let Some(prefix) = &params.metrics_out {
         utils::dump_sketch_metrics(&all_metrics, prefix, sketch_wall_start.elapsed().as_nanos());
     }
+
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -413,7 +416,7 @@ fn ordered_indexed_sketch_results(
 #[cfg(feature = "cuda")]
 fn sketch_one_file_cuda(
     index: usize,
-    file: &PathBuf,
+    input: &SketchInput,
     params: &SketchParams,
     reader_gate: Option<&Arc<ReaderGate>>,
     scratch: &mut CudaSketchLaneScratch,
@@ -427,11 +430,12 @@ fn sketch_one_file_cuda(
         hv_d: params.hv_d,
         hv_quant_bits: 16u8,
         hv_norm_2: 0,
-        file_str: file.display().to_string(),
+        file_str: input.file_id.clone(),
         hv: Vec::<i32>::new(),
     };
 
-    let mut metrics = extract_kmer_t1ha2_cuda_full_hashes_into(&sketch, reader_gate, scratch)?;
+    let mut metrics =
+        extract_kmer_t1ha2_cuda_full_hashes_into(&input.read_path, &sketch, reader_gate, scratch)?;
     metrics.file = sketch.file_str.clone();
     metrics.hashes_seen = scratch.full_hashes.len();
 
@@ -558,13 +562,13 @@ fn sketch_one_file_cuda(
 
 #[cfg(feature = "cuda")]
 fn extract_kmer_t1ha2_cuda_full_hashes_into(
+    read_path: &Path,
     sketch: &FileSketch,
     reader_gate: Option<&Arc<ReaderGate>>,
     scratch: &mut CudaSketchLaneScratch,
 ) -> Result<FileSketchMetrics> {
     scratch.full_hashes.clear();
 
-    let fna_file = PathBuf::from(sketch.file_str.clone());
     let wait_start = Instant::now();
     let permit = reader_gate.map(|gate| gate.acquire());
     let fasta_wait_ns = if permit.is_some() {
@@ -573,7 +577,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes_into(
         0
     };
     let fasta_start = Instant::now();
-    let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
+    let fna_seqs = fastx_reader::read_merge_seq(read_path);
     let fasta_ns = fasta_start.elapsed().as_nanos();
     drop(permit);
 

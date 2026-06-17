@@ -2,3 +2,4 @@
 Cargo.lock
 *.sketch
 *.sketch.ull
+__pycache__/

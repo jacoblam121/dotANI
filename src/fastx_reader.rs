@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use needletail::{Sequence, parse_fastx_file};
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct ReaderGate {
     tokens: Sender<()>,
@@ -45,7 +45,7 @@ impl Drop for ReaderPermit {
 }
 
 // Read merged sequences from a genome file into single u8 vector
-pub fn read_merge_seq(file_name: &PathBuf) -> Vec<u8> {
+pub fn read_merge_seq(file_name: &Path) -> Vec<u8> {
     let mut fna_seqs = Vec::<u8>::new();
 
     let mut fastx_reader = parse_fastx_file(file_name).expect("Opening .fna files failed");

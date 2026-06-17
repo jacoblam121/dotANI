@@ -50,7 +50,17 @@ fn main() {
                 .short('p')
                 .long("path")
                 .help("Input folder path containing .fna/.fa/.fasta files (gzip/bzip2/xz/zstd compressed files supported, e.g., .fna.gz, .fa.bz2, .fasta.xz, .fna.zst)")
-                .required(true)
+                .required_unless_present("manifest")
+                .conflicts_with("manifest")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("manifest")
+                .long("manifest")
+                .help("Input TSV manifest with read_path and file_id columns; row order is preserved")
+                .required_unless_present("path")
+                .conflicts_with("path")
                 .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
@@ -278,7 +288,11 @@ fn main() {
 
         let cli_params = types::CliParams {
             mode: params::CMD_SKETCH.to_string(),
-            path: sketch_m.get_one::<PathBuf>("path").cloned().unwrap(),
+            path: sketch_m
+                .get_one::<PathBuf>("path")
+                .cloned()
+                .unwrap_or_default(),
+            manifest: sketch_m.get_one::<PathBuf>("manifest").cloned(),
             path_ref_sketch: PathBuf::new(),
             path_query_sketch: PathBuf::new(),
             out_file: out_file.clone(),
@@ -307,16 +321,27 @@ fn main() {
 
         let sketch_params = types::SketchParams::new(&cli_params);
 
-        if sketch_params.device == "cuda" {
+        let sketch_result = if sketch_params.device == "cuda" {
             #[cfg(feature = "cuda")]
-            sketch_cuda::sketch_cuda(sketch_params);
+            {
+                sketch_cuda::sketch_cuda(sketch_params)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                unreachable!("--device cuda is rejected when the cuda feature is disabled")
+            }
         } else {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(cli_params.threads as usize)
                 .build_global()
                 .unwrap();
 
-            sketch::sketch(sketch_params);
+            sketch::sketch(sketch_params)
+        };
+
+        if let Err(e) = sketch_result {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
         let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
@@ -330,6 +355,7 @@ fn main() {
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
             path: PathBuf::new(),
+            manifest: None,
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
             out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
@@ -373,6 +399,7 @@ fn main() {
         let cli_params = types::CliParams {
             mode: params::CMD_SEARCH.to_string(),
             path: PathBuf::new(),
+            manifest: None,
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
             out_file: search_m.get_one::<PathBuf>("out").cloned().unwrap(),
