@@ -8,7 +8,7 @@ use log::LevelFilter;
 
 #[cfg(feature = "cuda")]
 use dotani::sketch_cuda;
-use dotani::{dist, params, sketch, types};
+use dotani::{chunked_sketch, dist, params, sketch, types};
 
 fn init_log() {
     Builder::new()
@@ -265,6 +265,35 @@ fn main() {
                 .action(ArgAction::Set),
         );
 
+    let convert_sketch_cmd = Command::new(params::CMD_CONVERT_SKETCH)
+        .about("Convert legacy DotHash and ULL sketch files to chunked sketch files")
+        .arg(
+            Arg::new("input")
+                .short('i')
+                .long("input")
+                .help("Input legacy DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .help("Output chunked DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("chunk_records")
+                .long("chunk-records")
+                .help("Number of sketch records per chunk")
+                .default_value("32768")
+                .value_parser(value_parser!(u32))
+                .action(ArgAction::Set),
+        );
+
     let matches = Command::new("dotani")
         .version(params::VERSION)
         .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and UltraLogLog, with GPU acceleration")
@@ -273,6 +302,7 @@ fn main() {
         .subcommand(sketch_cmd)
         .subcommand(dist_cmd)
         .subcommand(search_cmd)
+        .subcommand(convert_sketch_cmd)
         .get_matches();
 
     if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
@@ -456,6 +486,15 @@ fn main() {
             .unwrap();
 
         let _ = cli_params;
+    } else if let Some(convert_m) = matches.subcommand_matches(params::CMD_CONVERT_SKETCH) {
+        let input = convert_m.get_one::<PathBuf>("input").cloned().unwrap();
+        let out = convert_m.get_one::<PathBuf>("out").cloned().unwrap();
+        let chunk_records = *convert_m.get_one::<u32>("chunk_records").unwrap();
+
+        if let Err(e) = chunked_sketch::convert_legacy_sketch(&input, &out, chunk_records) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     } else {
         unreachable!("clap should ensure we don't get here");
     }

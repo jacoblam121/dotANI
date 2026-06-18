@@ -1,3 +1,4 @@
+pub mod chunked_sketch;
 pub mod dist;
 pub mod fastx_reader;
 pub mod hd;

@@ -15,6 +15,8 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "cuda")]
+use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(target_arch = "x86_64")]
@@ -976,6 +978,12 @@ fn stream_hv_ani_gpu_multi(
         let mut received_jobs = 0usize;
         let mut first_error = None;
         let stream_wall_start = Instant::now();
+        let mut next_progress_log = stream_wall_start + Duration::from_secs(30);
+        let total_pairs = if if_symmetric {
+            (ref_filesketch.len() as u128) * ((query_filesketch.len() - 1) as u128) / 2
+        } else {
+            (ref_filesketch.len() as u128) * (query_filesketch.len() as u128)
+        };
         let mut breakdown = GpuStreamBreakdown::default();
         breakdown.resident_flatten_ns = resident_flatten_ns;
 
@@ -993,6 +1001,27 @@ fn stream_hv_ani_gpu_multi(
                     total_hits += batch.num_hits;
                     pb.inc(batch.num_pairs_done as u64);
                     breakdown.add_batch(&batch);
+                    let now = Instant::now();
+                    if now >= next_progress_log {
+                        let elapsed_secs = stream_wall_start.elapsed().as_secs_f64();
+                        let pairs_sec = if elapsed_secs > 0.0 {
+                            breakdown.pairs as f64 / elapsed_secs
+                        } else {
+                            0.0
+                        };
+                        info!(
+                            "gpu stream progress: elapsed={:.1}s jobs={}/{} pairs={}/{} hits={} output_mb={:.3} pairs_sec={:.1}",
+                            elapsed_secs,
+                            received_jobs,
+                            total_jobs,
+                            breakdown.pairs,
+                            total_pairs,
+                            total_hits,
+                            breakdown.output_bytes as f64 / (1024.0 * 1024.0),
+                            pairs_sec
+                        );
+                        next_progress_log = now + Duration::from_secs(30);
+                    }
                 }
                 GpuPipelineMessage::Batch(Err(e)) => {
                     cancel.store(true, Ordering::Relaxed);

@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{hd, types::*};
+use crate::{chunked_sketch, hd, types::*};
 
 pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
     let mut all_files = Vec::new();
@@ -211,6 +211,9 @@ pub fn dump_sketch(file_sketch: &Vec<FileSketch>, out_file_path: &PathBuf) {
 
 pub fn load_sketch(path: &Path) -> Vec<FileSketch> {
     info!("Loading sketch from {}", path.to_str().unwrap());
+    if chunked_sketch::is_chunked_hd_path(path).expect("Opening sketch file failed!") {
+        return chunked_sketch::load_chunked_hd(path).expect("Loading chunked sketch file failed!");
+    }
     let serialized = fs::read(path).expect("Opening sketch file failed!");
     bincode::deserialize::<Vec<FileSketch>>(&serialized[..]).unwrap()
 }
@@ -379,6 +382,10 @@ fn optional_ns(value: Option<u128>) -> String {
 
 pub fn load_ull_sketch(path: &Path) -> Vec<FileUllSketch> {
     info!("Loading ULL sketch from {}", path.to_str().unwrap());
+    if chunked_sketch::is_chunked_ull_path(path).expect("Opening ULL sketch file failed!") {
+        return chunked_sketch::load_chunked_ull(path)
+            .expect("Loading chunked ULL sketch file failed!");
+    }
     let bytes = fs::read(path).expect("Opening ULL sketch file failed!");
 
     // New format: zstd-compressed bincode

@@ -211,7 +211,44 @@ void dot_rect_i32_i64_tiled_rb(
 "#;
 
 pub fn device_count() -> Result<usize> {
-    Ok(CudaContext::device_count()? as usize)
+    const CUDA_DEVICE_PROBE_LIMIT: usize = 64;
+    let mut device_ids = 0usize;
+
+    for dev_id in 0..CUDA_DEVICE_PROBE_LIMIT {
+        match CudaContext::new(dev_id) {
+            Ok(_) => device_ids += 1,
+            Err(_) if dev_id > 0 => break,
+            Err(first_err) => {
+                return Err(match CudaContext::device_count() {
+                    Ok(n) => anyhow::anyhow!(
+                        "Failed to open CUDA device 0 ({first_err:?}); CUDA device_count() reported {n} visible device(s)"
+                    ),
+                    Err(count_err) => anyhow::anyhow!(
+                        "Failed to open CUDA device 0 ({first_err:?}); CUDA device_count() also failed ({count_err:?})"
+                    ),
+                });
+            }
+        }
+    }
+
+    if device_ids == 0 {
+        return Err(anyhow::anyhow!("No CUDA devices are visible for GPU dist"));
+    }
+
+    match CudaContext::device_count() {
+        Ok(n) if n as usize != device_ids => log::warn!(
+            "CUDA ordinal probing found {} usable device(s), but device_count() reported {}",
+            device_ids,
+            n
+        ),
+        Ok(_) => {}
+        Err(e) => log::warn!(
+            "CUDA device_count() failed ({e:?}); using {} device(s) found by ordinal probing",
+            device_ids
+        ),
+    }
+
+    Ok(device_ids)
 }
 
 #[inline]
