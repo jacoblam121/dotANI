@@ -227,6 +227,14 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("output_format")
+                .long("output-format")
+                .help("Dist output stream format; zstd-text outputs are typically named with a .zst suffix")
+                .default_value("text")
+                .value_parser(["text", "zstd-text"])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("resident_matrix")
                 .long("resident-matrix")
                 .help("CUDA symmetric resident matrix mode")
@@ -373,6 +381,7 @@ fn main() {
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
             dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
+            dist_output_format: types::DistOutputFormat::Text,
             resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
 
@@ -441,6 +450,9 @@ fn main() {
             dist_output_mode: types::DistOutputMode::from_cli_value(
                 dist_m.get_one::<String>("output_mode").unwrap(),
             ),
+            dist_output_format: types::DistOutputFormat::from_cli_value(
+                dist_m.get_one::<String>("output_format").unwrap(),
+            ),
             resident_matrix_mode: types::ResidentMatrixMode::from_cli_value(
                 dist_m.get_one::<String>("resident_matrix").unwrap(),
             ),
@@ -490,6 +502,7 @@ fn main() {
             metrics_out: None,
             dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
+            dist_output_format: types::DistOutputFormat::Text,
             resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
 

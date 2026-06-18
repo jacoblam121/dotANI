@@ -27,6 +27,27 @@ use std::arch::x86_64::*;
 #[cfg(feature = "cuda")]
 use crate::cuda_dot::{GpuDotExecutor, device_count};
 
+const ZSTD_COMPRESSION_LEVEL: i32 = 0; // Use the zstd library default compression level.
+
+fn create_dist_output_writer(
+    out_path: &std::path::Path,
+    output_format: DistOutputFormat,
+) -> Box<dyn Write + Send> {
+    let file = File::create(out_path).expect("Failed to create dist output file");
+    match output_format {
+        DistOutputFormat::Text => Box::new(BufWriter::new(file)),
+        DistOutputFormat::ZstdText => {
+            let encoder = zstd::stream::write::Encoder::new(file, ZSTD_COMPRESSION_LEVEL)
+                .expect("Failed to create zstd encoder");
+            Box::new(encoder.on_finish(|result| {
+                if let Err(e) = result {
+                    warn!("failed to finish zstd dist output stream: {e:?}");
+                }
+            }))
+        }
+    }
+}
+
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
@@ -321,13 +342,15 @@ fn stream_hv_ani_cpu(
     if_symmetric: bool,
     ani_threshold: f32,
     output_mode: DistOutputMode,
+    output_format: DistOutputFormat,
 ) -> usize {
     const ROW_BLOCK: usize = 32;
     const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 
     let writer = if output_mode == DistOutputMode::Rows {
-        Some(Arc::new(Mutex::new(BufWriter::new(
-            File::create(out_path).expect("Failed to create ANI output file"),
+        Some(Arc::new(Mutex::new(create_dist_output_writer(
+            out_path,
+            output_format,
         ))))
     } else {
         None
@@ -522,13 +545,14 @@ fn stream_hv_ani_cpu_count_block(
 fn write_count_summary(
     out_path: &std::path::Path,
     output_mode: DistOutputMode,
+    output_format: DistOutputFormat,
     refs: usize,
     queries: usize,
     pairs: u64,
     hits: u64,
     ani_threshold: f32,
 ) {
-    let mut writer = BufWriter::new(File::create(out_path).expect("Failed to create count output"));
+    let mut writer = create_dist_output_writer(out_path, output_format);
     writeln!(writer, "metric\tvalue").expect("Failed to write count output");
     writeln!(writer, "mode\t{}", output_mode.as_str()).expect("Failed to write count output");
     writeln!(writer, "refs\t{}", refs).expect("Failed to write count output");
@@ -683,6 +707,7 @@ fn dist_chunked_count_cpu(sketch_dist: &SketchDist, if_symmetric: bool) -> Resul
     write_count_summary(
         sketch_dist.out_file.as_path(),
         sketch_dist.output_mode,
+        sketch_dist.output_format,
         num_ref_files,
         num_query_files,
         total_pairs,
@@ -1065,7 +1090,7 @@ fn postprocess_dot_tile_batch(
 
 #[cfg(feature = "cuda")]
 fn stream_hv_ani_gpu_multi(
-    mut writer: Option<&mut BufWriter<File>>,
+    mut writer: Option<&mut Box<dyn Write + Send>>,
     pb: &indicatif::ProgressBar,
     ref_filesketch: &[FileSketch],
     query_filesketch: &[FileSketch],
@@ -1506,7 +1531,9 @@ mod tests {
     use super::{ani_from_intersection_and_cardinalities, stream_hv_ani_cpu};
     #[cfg(feature = "cuda")]
     use crate::types::ResidentMatrixMode;
-    use crate::types::{DistMode, DistOutputMode, FileSketch, FileUllSketch, SketchDist};
+    use crate::types::{
+        DistMode, DistOutputFormat, DistOutputMode, FileSketch, FileUllSketch, SketchDist,
+    };
     use crate::{chunked_sketch, hd};
     use std::collections::HashSet;
     #[cfg(feature = "cuda")]
@@ -1646,6 +1673,13 @@ mod tests {
             .collect()
     }
 
+    fn read_zstd_text(path: &std::path::Path) -> String {
+        let bytes = std::fs::read(path).expect("failed to read compressed output");
+        let decoded =
+            zstd::stream::decode_all(bytes.as_slice()).expect("failed to decode compressed output");
+        String::from_utf8(decoded).expect("compressed output was not valid UTF-8")
+    }
+
     #[cfg(feature = "cuda")]
     fn test_dot_tile_batch(
         job: super::GpuTileJob,
@@ -1704,6 +1738,7 @@ mod tests {
             false,
             0.0,
             DistOutputMode::Rows,
+            DistOutputFormat::Text,
         );
         assert_eq!(hits, 4);
         assert_eq!(
@@ -1744,11 +1779,73 @@ mod tests {
             false,
             85.0,
             DistOutputMode::Rows,
+            DistOutputFormat::Text,
         );
         assert_eq!(hits, 2);
         assert_eq!(
             read_rows_as_set(&out),
             HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn cpu_stream_zstd_text_rows_decompress_to_expected_rows() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("zstd_rows");
+        let pb = indicatif::ProgressBar::hidden();
+
+        let hits = stream_hv_ani_cpu(
+            &out,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Rows,
+            DistOutputFormat::ZstdText,
+        );
+
+        let rows: HashSet<String> = read_zstd_text(&out).lines().map(str::to_owned).collect();
+        assert_eq!(hits, 2);
+        assert_eq!(
+            rows,
+            HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn zstd_text_count_summary_decompresses_to_m1_tsv_payload() {
+        let out = temp_ani_path("zstd_count_summary");
+
+        super::write_count_summary(
+            &out,
+            DistOutputMode::Count,
+            DistOutputFormat::ZstdText,
+            2,
+            3,
+            6,
+            4,
+            95.0,
+        );
+
+        assert_eq!(
+            read_zstd_text(&out),
+            "metric\tvalue\nmode\tcount\nrefs\t2\nqueries\t3\npairs\t6\nhits\t4\nani_threshold\t95\n"
         );
 
         let _ = std::fs::remove_file(out);
@@ -1781,6 +1878,7 @@ mod tests {
             false,
             85.0,
             DistOutputMode::Rows,
+            DistOutputFormat::Text,
         );
         let row_count = std::fs::read_to_string(&rows_out)
             .expect("failed to read rows output")
@@ -1797,6 +1895,7 @@ mod tests {
             false,
             85.0,
             DistOutputMode::Count,
+            DistOutputFormat::Text,
         );
 
         assert_eq!(row_hits, 2);
@@ -1829,6 +1928,7 @@ mod tests {
             true,
             0.0,
             DistOutputMode::Rows,
+            DistOutputFormat::Text,
         );
 
         assert_eq!(hits, 3);
@@ -1898,6 +1998,7 @@ mod tests {
             false,
             50.0,
             DistOutputMode::Count,
+            DistOutputFormat::Text,
         );
 
         assert_eq!(read_count_summary_value(&out, "refs"), "2");
@@ -2236,7 +2337,9 @@ mod tests {
         let cards = vec![100.0, 100.0];
         let out = temp_ani_path("gpu_threshold_zero");
         let pb = indicatif::ProgressBar::hidden();
-        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+        let mut writer: Box<dyn Write + Send> = Box::new(BufWriter::new(
+            File::create(&out).expect("failed to create output"),
+        ));
 
         let hits = stream_hv_ani_gpu_multi(
             Some(&mut writer),
@@ -2283,7 +2386,9 @@ mod tests {
         let cards = vec![100.0, 100.0];
         let out = temp_ani_path("gpu_threshold_85");
         let pb = indicatif::ProgressBar::hidden();
-        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+        let mut writer: Box<dyn Write + Send> = Box::new(BufWriter::new(
+            File::create(&out).expect("failed to create output"),
+        ));
 
         let hits = stream_hv_ani_gpu_multi(
             Some(&mut writer),
@@ -2313,6 +2418,50 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    fn gpu_stream_zstd_text_rows_decompress_to_expected_rows() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("gpu_zstd_rows");
+        let pb = indicatif::ProgressBar::hidden();
+        let mut writer = super::create_dist_output_writer(&out, DistOutputFormat::ZstdText);
+
+        let hits = stream_hv_ani_gpu_multi(
+            Some(&mut writer),
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            1,
+            DistOutputMode::Rows,
+            ResidentMatrixMode::Auto,
+        )
+        .expect("GPU stream should compute compressed rows");
+        writer.flush().expect("failed to flush compressed output");
+        drop(writer);
+
+        let rows: HashSet<String> = read_zstd_text(&out).lines().map(str::to_owned).collect();
+        assert_eq!(hits, 2);
+        assert_eq!(
+            rows,
+            HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
     fn gpu_stream_count_mode_matches_rows_hit_count() {
         let refs = vec![
             test_filesketch("r0", vec![4, 0, 0, 0]),
@@ -2325,7 +2474,9 @@ mod tests {
         let cards = vec![100.0, 100.0];
         let out = temp_ani_path("gpu_rows_count_compare");
         let pb = indicatif::ProgressBar::hidden();
-        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+        let mut writer: Box<dyn Write + Send> = Box::new(BufWriter::new(
+            File::create(&out).expect("failed to create output"),
+        ));
 
         let row_hits = stream_hv_ani_gpu_multi(
             Some(&mut writer),
@@ -2382,7 +2533,9 @@ mod tests {
         let cards = vec![100.0, 100.0, 100.0];
         let out = temp_ani_path("gpu_symmetric_resident");
         let pb = indicatif::ProgressBar::hidden();
-        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+        let mut writer: Box<dyn Write + Send> = Box::new(BufWriter::new(
+            File::create(&out).expect("failed to create output"),
+        ));
 
         let hits = stream_hv_ani_gpu_multi(
             Some(&mut writer),
@@ -2459,9 +2612,10 @@ pub fn compute_hv_ani(
     let (num_hits, output_open_secs, flush_secs, stream_mode) = {
         let mut writer = if sketch_dist.output_mode == DistOutputMode::Rows {
             let output_open_start = Instant::now();
-            let out_file = File::create(sketch_dist.out_file.as_path())
-                .expect("Failed to create ANI output file");
-            let writer = BufWriter::new(out_file);
+            let writer = create_dist_output_writer(
+                sketch_dist.out_file.as_path(),
+                sketch_dist.output_format,
+            );
             (Some(writer), output_open_start.elapsed().as_secs_f32())
         } else {
             (None, 0.0)
@@ -2505,6 +2659,7 @@ pub fn compute_hv_ani(
                     if_symmetric,
                     sketch_dist.ani_threshold,
                     sketch_dist.output_mode,
+                    sketch_dist.output_format,
                 );
                 (n, 0.0, 0.0, "gpu_fallback_cpu")
             }
@@ -2524,6 +2679,7 @@ pub fn compute_hv_ani(
             if_symmetric,
             sketch_dist.ani_threshold,
             sketch_dist.output_mode,
+            sketch_dist.output_format,
         );
         (n, 0.0, 0.0, "cpu")
     };
@@ -2558,6 +2714,7 @@ pub fn compute_hv_ani(
         write_count_summary(
             sketch_dist.out_file.as_path(),
             sketch_dist.output_mode,
+            sketch_dist.output_format,
             num_ref_files,
             num_query_files,
             total_dist,
