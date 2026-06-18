@@ -29,74 +29,94 @@ pub fn dist(sketch_dist: &mut SketchDist) {
 
     let ull_load_start = Instant::now();
     let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path());
-    let query_ull_sketch = if if_sym {
-        ref_ull_sketch.clone()
+    let query_ull_sketch_storage = if if_sym {
+        None
     } else {
-        utils::load_ull_sketch(sketch_dist.path_query_ull.as_path())
+        Some(utils::load_ull_sketch(sketch_dist.path_query_ull.as_path()))
     };
     let ull_load_secs = ull_load_start.elapsed().as_secs_f32();
 
     let sketch_load_start = Instant::now();
     let mut ref_file_sketch = utils::load_sketch(sketch_dist.path_ref_sketch.as_path());
-    let mut query_file_sketch = if if_sym {
-        ref_file_sketch.clone()
+    let mut query_file_sketch_storage = if if_sym {
+        None
     } else {
-        utils::load_sketch(sketch_dist.path_query_sketch.as_path())
+        Some(utils::load_sketch(sketch_dist.path_query_sketch.as_path()))
     };
     let sketch_load_secs = sketch_load_start.elapsed().as_secs_f32();
 
     let validation_start = Instant::now();
-    assert_eq!(
-        ref_file_sketch.len(),
-        ref_ull_sketch.len(),
-        "Ref HD and ULL sketch counts differ"
-    );
-    assert_eq!(
-        query_file_sketch.len(),
-        query_ull_sketch.len(),
-        "Query HD and ULL sketch counts differ"
-    );
+    let ksize_ref;
+    let hv_d_ref;
+    {
+        let query_ull_sketch: &[FileUllSketch] = query_ull_sketch_storage
+            .as_deref()
+            .unwrap_or(&ref_ull_sketch);
+        let query_file_sketch: &[FileSketch] = query_file_sketch_storage
+            .as_deref()
+            .unwrap_or(&ref_file_sketch);
 
-    for i in 0..ref_file_sketch.len() {
         assert_eq!(
-            ref_file_sketch[i].file_str, ref_ull_sketch[i].file_str,
-            "Ref HD/ULL file order mismatch"
+            ref_file_sketch.len(),
+            ref_ull_sketch.len(),
+            "Ref HD and ULL sketch counts differ"
+        );
+        assert_eq!(
+            query_file_sketch.len(),
+            query_ull_sketch.len(),
+            "Query HD and ULL sketch counts differ"
+        );
+
+        for i in 0..ref_file_sketch.len() {
+            assert_eq!(
+                ref_file_sketch[i].file_str, ref_ull_sketch[i].file_str,
+                "Ref HD/ULL file order mismatch"
+            );
+        }
+        for i in 0..query_file_sketch.len() {
+            assert_eq!(
+                query_file_sketch[i].file_str, query_ull_sketch[i].file_str,
+                "Query HD/ULL file order mismatch"
+            );
+        }
+
+        ksize_ref = ref_file_sketch[0].ksize;
+        let ksize_query = query_file_sketch[0].ksize;
+        assert_eq!(
+            ksize_ref, ksize_query,
+            "Ref and query sketches use different kmer sizes!"
+        );
+
+        hv_d_ref = ref_file_sketch[0].hv_d;
+        let hv_d_query = query_file_sketch[0].hv_d;
+        assert_eq!(
+            hv_d_ref, hv_d_query,
+            "Ref and query sketches use different HV dimensions!"
         );
     }
-    for i in 0..query_file_sketch.len() {
-        assert_eq!(
-            query_file_sketch[i].file_str, query_ull_sketch[i].file_str,
-            "Query HD/ULL file order mismatch"
-        );
-    }
-
-    let ksize_ref = ref_file_sketch[0].ksize;
-    let ksize_query = query_file_sketch[0].ksize;
-    assert_eq!(
-        ksize_ref, ksize_query,
-        "Ref and query sketches use different kmer sizes!"
-    );
-
-    let hv_d_ref = ref_file_sketch[0].hv_d;
-    let hv_d_query = query_file_sketch[0].hv_d;
-    assert_eq!(
-        hv_d_ref, hv_d_query,
-        "Ref and query sketches use different HV dimensions!"
-    );
     let validation_secs = validation_start.elapsed().as_secs_f32();
 
     let decompress_start = Instant::now();
     hd::decompress_file_sketch(&mut ref_file_sketch);
-    hd::decompress_file_sketch(&mut query_file_sketch);
+    if let Some(query_file_sketch) = query_file_sketch_storage.as_mut() {
+        hd::decompress_file_sketch(query_file_sketch);
+    }
     let decompress_secs = decompress_start.elapsed().as_secs_f32();
+
+    let query_ull_sketch: &[FileUllSketch] = query_ull_sketch_storage
+        .as_deref()
+        .unwrap_or(&ref_ull_sketch);
+    let query_file_sketch: &[FileSketch] = query_file_sketch_storage
+        .as_deref()
+        .unwrap_or(&ref_file_sketch);
 
     let compute_start = Instant::now();
     compute_hv_ani(
         sketch_dist,
         &ref_file_sketch,
-        &query_file_sketch,
+        query_file_sketch,
         &ref_ull_sketch,
-        &query_ull_sketch,
+        query_ull_sketch,
         ksize_ref,
         if_sym,
     );
@@ -291,13 +311,18 @@ fn stream_hv_ani_cpu(
     ksize: u8,
     if_symmetric: bool,
     ani_threshold: f32,
+    output_mode: DistOutputMode,
 ) -> usize {
     const ROW_BLOCK: usize = 32;
     const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 
-    let writer = Arc::new(Mutex::new(BufWriter::new(
-        File::create(out_path).expect("Failed to create ANI output file"),
-    )));
+    let writer = if output_mode == DistOutputMode::Rows {
+        Some(Arc::new(Mutex::new(BufWriter::new(
+            File::create(out_path).expect("Failed to create ANI output file"),
+        ))))
+    } else {
+        None
+    };
     let total_hits = AtomicUsize::new(0);
     let total_ani_evals = AtomicUsize::new(0);
     let total_nonpositive_skipped = AtomicUsize::new(0);
@@ -307,7 +332,11 @@ fn stream_hv_ani_cpu(
     row_starts.into_par_iter().for_each(|i0| {
         let i1 = (i0 + ROW_BLOCK).min(ref_filesketch.len());
 
-        let mut local_text = String::with_capacity(1 << 20);
+        let mut local_text = if output_mode == DistOutputMode::Rows {
+            String::with_capacity(1 << 20)
+        } else {
+            String::new()
+        };
         let mut local_hits = 0usize;
         let mut local_pairs_done = 0usize;
         let mut local_ani_evals = 0usize;
@@ -337,19 +366,25 @@ fn stream_hv_ani_cpu(
                 );
 
                 if ani >= ani_threshold {
-                    use std::fmt::Write as _;
-                    let _ = writeln!(
-                        &mut local_text,
-                        "{}\t{}\t{:.3}",
-                        r.file_str, q.file_str, ani
-                    );
+                    if output_mode == DistOutputMode::Rows {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(
+                            &mut local_text,
+                            "{}\t{}\t{:.3}",
+                            r.file_str, q.file_str, ani
+                        );
+                    }
                     local_hits += 1;
                 }
 
                 local_pairs_done += 1;
 
                 if local_text.len() >= FLUSH_BYTES {
-                    let mut guard = writer.lock().expect("ANI writer mutex poisoned");
+                    let mut guard = writer
+                        .as_ref()
+                        .expect("rows mode writer missing")
+                        .lock()
+                        .expect("ANI writer mutex poisoned");
                     guard
                         .write_all(local_text.as_bytes())
                         .expect("Failed to write ANI batch");
@@ -359,7 +394,11 @@ fn stream_hv_ani_cpu(
         }
 
         if !local_text.is_empty() {
-            let mut guard = writer.lock().expect("ANI writer mutex poisoned");
+            let mut guard = writer
+                .as_ref()
+                .expect("rows mode writer missing")
+                .lock()
+                .expect("ANI writer mutex poisoned");
             guard
                 .write_all(local_text.as_bytes())
                 .expect("Failed to write ANI batch");
@@ -371,11 +410,13 @@ fn stream_hv_ani_cpu(
         pb.inc(local_pairs_done as u64);
     });
 
-    writer
-        .lock()
-        .expect("ANI writer mutex poisoned")
-        .flush()
-        .expect("Failed to flush ANI output");
+    if let Some(writer) = writer {
+        writer
+            .lock()
+            .expect("ANI writer mutex poisoned")
+            .flush()
+            .expect("Failed to flush ANI output");
+    }
 
     info!(
         "cpu stream breakdown: hits={} ani_evals={} nonpositive_skipped={}",
@@ -534,6 +575,7 @@ fn postprocess_dot_tile_batch(
     ksize: u8,
     if_symmetric: bool,
     ani_threshold: f32,
+    output_mode: DistOutputMode,
 ) -> TileBatchResult {
     let postprocess_start = Instant::now();
     let mut text = String::new();
@@ -569,12 +611,14 @@ fn postprocess_dot_tile_batch(
             );
 
             if ani >= ani_threshold {
-                use std::fmt::Write as _;
-                let _ = writeln!(
-                    &mut text,
-                    "{}\t{}\t{:.3}",
-                    ref_filesketch[i].file_str, query_filesketch[j].file_str, ani
-                );
+                if output_mode == DistOutputMode::Rows {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        &mut text,
+                        "{}\t{}\t{:.3}",
+                        ref_filesketch[i].file_str, query_filesketch[j].file_str, ani
+                    );
+                }
                 num_hits += 1;
             }
         }
@@ -615,7 +659,7 @@ fn postprocess_dot_tile_batch(
 
 #[cfg(feature = "cuda")]
 fn stream_hv_ani_gpu_multi(
-    writer: &mut BufWriter<File>,
+    mut writer: Option<&mut BufWriter<File>>,
     pb: &indicatif::ProgressBar,
     ref_filesketch: &[FileSketch],
     query_filesketch: &[FileSketch],
@@ -625,6 +669,8 @@ fn stream_hv_ani_gpu_multi(
     if_symmetric: bool,
     ani_threshold: f32,
     threads: usize,
+    output_mode: DistOutputMode,
+    resident_matrix_mode: ResidentMatrixMode,
 ) -> anyhow::Result<usize> {
     if ref_filesketch.is_empty() || query_filesketch.is_empty() {
         return Ok(0);
@@ -636,9 +682,8 @@ fn stream_hv_ani_gpu_multi(
 
     let ng = device_count()?.max(1);
     info!("Using {} GPU worker(s) for tiled dot-product", ng);
-    // Patch 4 optimizes symmetric runtime first. Host memory still peaks higher
-    // than ideal because dist keeps cloned query/ref sketches and this flat copy.
-    let (resident_flat_host, resident_flatten_ns) = if if_symmetric {
+    let use_resident_matrix = if_symmetric && resident_matrix_mode == ResidentMatrixMode::Auto;
+    let (resident_flat_host, resident_flatten_ns) = if use_resident_matrix {
         let flatten_start = Instant::now();
         let flat = flatten_hv_matrix(ref_filesketch);
         (Some(flat), flatten_start.elapsed().as_nanos())
@@ -698,6 +743,7 @@ fn stream_hv_ani_gpu_multi(
                         ksize,
                         if_symmetric,
                         ani_threshold,
+                        output_mode,
                     );
 
                     if cancel.load(Ordering::Relaxed) {
@@ -938,9 +984,11 @@ fn stream_hv_ani_gpu_multi(
                 GpuPipelineMessage::Batch(Ok(batch)) => {
                     received_jobs += 1;
                     let write_start = Instant::now();
-                    writer
-                        .write_all(batch.text.as_bytes())
-                        .expect("Failed to write ANI batch");
+                    if let Some(writer) = writer.as_deref_mut() {
+                        writer
+                            .write_all(batch.text.as_bytes())
+                            .expect("Failed to write ANI batch");
+                    }
                     breakdown.write_ns += write_start.elapsed().as_nanos();
                     total_hits += batch.num_hits;
                     pb.inc(batch.num_pairs_done as u64);
@@ -974,6 +1022,8 @@ fn stream_hv_ani_gpu_multi(
             // Worker timings are aggregate worker-sums; postprocess can exceed wall after pipelining.
             let resident_mode = if !if_symmetric {
                 "disabled"
+            } else if resident_matrix_mode == ResidentMatrixMode::Off {
+                "off"
             } else if breakdown.resident_tiles > 0 && breakdown.resident_fallback_tiles == 0 {
                 "symmetric"
             } else {
@@ -1021,7 +1071,9 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::stream_hv_ani_gpu_multi;
     use super::{ani_from_intersection_and_cardinalities, stream_hv_ani_cpu};
-    use crate::types::FileSketch;
+    #[cfg(feature = "cuda")]
+    use crate::types::ResidentMatrixMode;
+    use crate::types::{DistOutputMode, FileSketch};
     use std::collections::HashSet;
     #[cfg(feature = "cuda")]
     use std::fs::File;
@@ -1115,7 +1167,18 @@ mod tests {
         let out = temp_ani_path("threshold_zero");
         let pb = indicatif::ProgressBar::hidden();
 
-        let hits = stream_hv_ani_cpu(&out, &pb, &refs, &queries, &cards, &cards, 1, false, 0.0);
+        let hits = stream_hv_ani_cpu(
+            &out,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            0.0,
+            DistOutputMode::Rows,
+        );
         assert_eq!(hits, 4);
         assert_eq!(
             read_rows_as_set(&out),
@@ -1144,11 +1207,112 @@ mod tests {
         let out = temp_ani_path("threshold_85");
         let pb = indicatif::ProgressBar::hidden();
 
-        let hits = stream_hv_ani_cpu(&out, &pb, &refs, &queries, &cards, &cards, 1, false, 85.0);
+        let hits = stream_hv_ani_cpu(
+            &out,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Rows,
+        );
         assert_eq!(hits, 2);
         assert_eq!(
             read_rows_as_set(&out),
             HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
+        );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn cpu_stream_count_mode_matches_rows_hit_count_without_rows_file() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let rows_out = temp_ani_path("rows_count_compare");
+        let count_out = temp_ani_path("count_no_rows");
+        let _ = std::fs::remove_file(&count_out);
+        let pb = indicatif::ProgressBar::hidden();
+
+        let row_hits = stream_hv_ani_cpu(
+            &rows_out,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Rows,
+        );
+        let row_count = std::fs::read_to_string(&rows_out)
+            .expect("failed to read rows output")
+            .lines()
+            .count();
+        let count_hits = stream_hv_ani_cpu(
+            &count_out,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Count,
+        );
+
+        assert_eq!(row_hits, 2);
+        assert_eq!(row_count, row_hits);
+        assert_eq!(count_hits, row_hits);
+        assert!(!count_out.exists());
+
+        let _ = std::fs::remove_file(rows_out);
+    }
+
+    #[test]
+    fn cpu_stream_symmetric_rows_preserve_upper_triangle_row_set() {
+        let sketches = vec![
+            test_filesketch("s0", vec![4, 0, 0, 0]),
+            test_filesketch("s1", vec![0, 4, 0, 0]),
+            test_filesketch("s2", vec![4, 0, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0, 100.0];
+        let out = temp_ani_path("cpu_symmetric_rows");
+        let pb = indicatif::ProgressBar::hidden();
+
+        let hits = stream_hv_ani_cpu(
+            &out,
+            &pb,
+            &sketches,
+            &sketches,
+            &cards,
+            &cards,
+            1,
+            true,
+            0.0,
+            DistOutputMode::Rows,
+        );
+
+        assert_eq!(hits, 3);
+        assert_eq!(
+            read_rows_as_set(&out),
+            HashSet::from([
+                "s0\ts1\t0.000".to_string(),
+                "s0\ts2\t4.000".to_string(),
+                "s1\ts2\t0.000".to_string(),
+            ])
         );
 
         let _ = std::fs::remove_file(out);
@@ -1176,7 +1340,15 @@ mod tests {
         );
 
         let result = super::postprocess_dot_tile_batch(
-            batch, &sketches, &sketches, &cards, &cards, 1, true, 0.0,
+            batch,
+            &sketches,
+            &sketches,
+            &cards,
+            &cards,
+            1,
+            true,
+            0.0,
+            DistOutputMode::Rows,
         );
 
         assert_eq!(result.num_pairs_done, 3);
@@ -1206,7 +1378,15 @@ mod tests {
         );
 
         let result = super::postprocess_dot_tile_batch(
-            batch, &refs, &queries, &cards, &cards, 1, false, 0.0,
+            batch,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            0.0,
+            DistOutputMode::Rows,
         );
 
         assert_eq!(result.num_hits, 1);
@@ -1240,7 +1420,15 @@ mod tests {
         );
 
         let result = super::postprocess_dot_tile_batch(
-            batch, &refs, &queries, &cards, &cards, 1, false, 85.0,
+            batch,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Rows,
         );
 
         assert_eq!(result.num_hits, 1);
@@ -1248,6 +1436,49 @@ mod tests {
         assert_eq!(result.ani_evals, 1);
         assert_eq!(result.nonpositive_skipped, 3);
         assert_eq!(result.text, "r0\tq0\t90.000\n");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_postprocess_helper_count_mode_matches_rows_hit_count_without_text() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 0, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let batch = test_dot_tile_batch(
+            super::GpuTileJob {
+                i0: 0,
+                i1: 2,
+                j0: 0,
+                j1: 2,
+            },
+            2,
+            2,
+            vec![360, 0, 0, 0],
+        );
+
+        let result = super::postprocess_dot_tile_batch(
+            batch,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            DistOutputMode::Count,
+        );
+
+        assert_eq!(result.num_hits, 1);
+        assert_eq!(result.ani_evals, 1);
+        assert_eq!(result.nonpositive_skipped, 3);
+        assert!(result.text.is_empty());
+        assert_eq!(result.text_bytes, 0);
     }
 
     #[cfg(feature = "cuda")]
@@ -1267,7 +1498,7 @@ mod tests {
         let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
 
         let hits = stream_hv_ani_gpu_multi(
-            &mut writer,
+            Some(&mut writer),
             &pb,
             &refs,
             &queries,
@@ -1277,6 +1508,8 @@ mod tests {
             false,
             0.0,
             1,
+            DistOutputMode::Rows,
+            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -1312,7 +1545,7 @@ mod tests {
         let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
 
         let hits = stream_hv_ani_gpu_multi(
-            &mut writer,
+            Some(&mut writer),
             &pb,
             &refs,
             &queries,
@@ -1322,6 +1555,8 @@ mod tests {
             false,
             85.0,
             1,
+            DistOutputMode::Rows,
+            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -1331,6 +1566,66 @@ mod tests {
             read_rows_as_set(&out),
             HashSet::from(["r0\tq0\t90.000".to_string(), "r1\tq1\t90.000".to_string(),])
         );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_stream_count_mode_matches_rows_hit_count() {
+        let refs = vec![
+            test_filesketch("r0", vec![4, 0, 0, 0]),
+            test_filesketch("r1", vec![0, 4, 0, 0]),
+        ];
+        let queries = vec![
+            test_filesketch("q0", vec![90, 0, 0, 0]),
+            test_filesketch("q1", vec![0, 90, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0];
+        let out = temp_ani_path("gpu_rows_count_compare");
+        let pb = indicatif::ProgressBar::hidden();
+        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+        let row_hits = stream_hv_ani_gpu_multi(
+            Some(&mut writer),
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            1,
+            DistOutputMode::Rows,
+            ResidentMatrixMode::Auto,
+        )
+        .expect("GPU stream should compute rows");
+        writer.flush().expect("failed to flush output");
+        let row_count = std::fs::read_to_string(&out)
+            .expect("failed to read rows output")
+            .lines()
+            .count();
+
+        let count_hits = stream_hv_ani_gpu_multi(
+            None,
+            &pb,
+            &refs,
+            &queries,
+            &cards,
+            &cards,
+            1,
+            false,
+            85.0,
+            1,
+            DistOutputMode::Count,
+            ResidentMatrixMode::Off,
+        )
+        .expect("GPU stream should compute count");
+
+        assert_eq!(row_hits, 2);
+        assert_eq!(row_count, row_hits);
+        assert_eq!(count_hits, row_hits);
 
         let _ = std::fs::remove_file(out);
     }
@@ -1349,7 +1644,7 @@ mod tests {
         let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
 
         let hits = stream_hv_ani_gpu_multi(
-            &mut writer,
+            Some(&mut writer),
             &pb,
             &sketches,
             &sketches,
@@ -1359,6 +1654,8 @@ mod tests {
             true,
             0.0,
             1,
+            DistOutputMode::Rows,
+            ResidentMatrixMode::Auto,
         )
         .expect("GPU symmetric stream should compute");
         writer.flush().expect("failed to flush output");
@@ -1419,14 +1716,18 @@ pub fn compute_hv_ani(
     let stream_start = Instant::now();
     #[cfg(feature = "cuda")]
     let (num_hits, output_open_secs, flush_secs, stream_mode) = {
-        let output_open_start = Instant::now();
-        let out_file =
-            File::create(sketch_dist.out_file.as_path()).expect("Failed to create ANI output file");
-        let mut writer = BufWriter::new(out_file);
-        let output_open_secs = output_open_start.elapsed().as_secs_f32();
+        let mut writer = if sketch_dist.output_mode == DistOutputMode::Rows {
+            let output_open_start = Instant::now();
+            let out_file = File::create(sketch_dist.out_file.as_path())
+                .expect("Failed to create ANI output file");
+            let writer = BufWriter::new(out_file);
+            (Some(writer), output_open_start.elapsed().as_secs_f32())
+        } else {
+            (None, 0.0)
+        };
 
         match stream_hv_ani_gpu_multi(
-            &mut writer,
+            writer.0.as_mut(),
             &pb,
             ref_filesketch,
             query_filesketch,
@@ -1436,13 +1737,17 @@ pub fn compute_hv_ani(
             if_symmetric,
             sketch_dist.ani_threshold,
             sketch_dist.threads as usize,
+            sketch_dist.output_mode,
+            sketch_dist.resident_matrix_mode,
         ) {
             Ok(n) => {
                 let flush_start = Instant::now();
-                writer.flush().expect("Failed to flush ANI output");
+                if let Some(writer) = writer.0.as_mut() {
+                    writer.flush().expect("Failed to flush ANI output");
+                }
                 let flush_secs = flush_start.elapsed().as_secs_f32();
                 info!("Multi-GPU tiled dot-product completed successfully");
-                (n, output_open_secs, flush_secs, "gpu")
+                (n, writer.1, flush_secs, "gpu")
             }
             Err(e) => {
                 warn!("Multi-GPU tiled dot-product failed, falling back to CPU: {e:?}");
@@ -1458,8 +1763,9 @@ pub fn compute_hv_ani(
                     ksize,
                     if_symmetric,
                     sketch_dist.ani_threshold,
+                    sketch_dist.output_mode,
                 );
-                (n, output_open_secs, 0.0, "gpu_fallback_cpu")
+                (n, 0.0, 0.0, "gpu_fallback_cpu")
             }
         }
     };
@@ -1476,6 +1782,7 @@ pub fn compute_hv_ani(
             ksize,
             if_symmetric,
             sketch_dist.ani_threshold,
+            sketch_dist.output_mode,
         );
         (n, 0.0, 0.0, "cpu")
     };
@@ -1505,6 +1812,21 @@ pub fn compute_hv_ani(
             sketch_dist.ani_threshold,
             sketch_dist.out_file.to_string_lossy()
         );
+    }
+    if sketch_dist.output_mode == DistOutputMode::Count {
+        let mut writer = BufWriter::new(
+            File::create(sketch_dist.out_file.as_path()).expect("Failed to create count output"),
+        );
+        writeln!(writer, "metric\tvalue").expect("Failed to write count output");
+        writeln!(writer, "mode\t{}", sketch_dist.output_mode.as_str())
+            .expect("Failed to write count output");
+        writeln!(writer, "refs\t{}", num_ref_files).expect("Failed to write count output");
+        writeln!(writer, "queries\t{}", num_query_files).expect("Failed to write count output");
+        writeln!(writer, "pairs\t{}", total_dist).expect("Failed to write count output");
+        writeln!(writer, "hits\t{}", cnt).expect("Failed to write count output");
+        writeln!(writer, "ani_threshold\t{}", sketch_dist.ani_threshold)
+            .expect("Failed to write count output");
+        writer.flush().expect("Failed to flush count output");
     }
     let summary_secs = summary_start.elapsed().as_secs_f32();
 
