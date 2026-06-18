@@ -88,6 +88,7 @@ pub struct CliParams {
     pub path_query_ull: PathBuf,
 
     pub metrics_out: Option<PathBuf>,
+    pub dist_mode: DistMode,
     pub dist_output_mode: DistOutputMode,
     pub resident_matrix_mode: ResidentMatrixMode,
 }
@@ -111,6 +112,29 @@ impl CudaDedupStrategy {
         match self {
             Self::HashSet => "hashset",
             Self::SortUnstable => "sort_unstable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistMode {
+    Full,
+    Chunked,
+}
+
+impl DistMode {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "full" => Self::Full,
+            "chunked" => Self::Chunked,
+            _ => panic!("Invalid dist mode: {value}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Chunked => "chunked",
         }
     }
 }
@@ -391,6 +415,7 @@ pub struct SketchDist {
     pub hv_d: usize,
     pub ani_threshold: f32,
     pub threads: u8,
+    pub dist_mode: DistMode,
     pub output_mode: DistOutputMode,
     pub resident_matrix_mode: ResidentMatrixMode,
     pub file_ani: Vec<((String, String), f32)>,
@@ -408,6 +433,7 @@ impl Default for SketchDist {
             hv_d: 1024,
             ani_threshold: 85.0,
             threads: 1,
+            dist_mode: DistMode::Full,
             output_mode: DistOutputMode::Rows,
             resident_matrix_mode: ResidentMatrixMode::Auto,
             file_ani: Vec::<((String, String), f32)>::new(),
@@ -427,6 +453,7 @@ impl SketchDist {
         new_dist.hv_d = params.hv_d;
         new_dist.ani_threshold = params.ani_threshold;
         new_dist.threads = params.threads;
+        new_dist.dist_mode = params.dist_mode;
         new_dist.output_mode = params.dist_output_mode;
         new_dist.resident_matrix_mode = params.resident_matrix_mode;
         new_dist

@@ -1,9 +1,11 @@
 use ultraloglog::UltraLogLog;
 
+use crate::chunked_sketch;
 use crate::hd;
 use crate::types::*;
 use crate::utils;
 
+use anyhow::{Result, bail};
 use log::{info, warn};
 use rayon::prelude::*;
 
@@ -28,6 +30,11 @@ use crate::cuda_dot::{GpuDotExecutor, device_count};
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
+
+    if sketch_dist.dist_mode == DistMode::Chunked {
+        dist_chunked_count_cpu(sketch_dist, if_sym).expect("chunked dist failed");
+        return;
+    }
 
     let ull_load_start = Instant::now();
     let ref_ull_sketch = utils::load_ull_sketch(sketch_dist.path_ref_ull.as_path());
@@ -428,6 +435,403 @@ fn stream_hv_ani_cpu(
     );
 
     total_hits.load(Ordering::Relaxed)
+}
+
+fn stream_hv_ani_cpu_count_block(
+    pb: &indicatif::ProgressBar,
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_cards: &[f64],
+    query_cards: &[f64],
+    ksize: u8,
+    if_symmetric: bool,
+    ref_global_start: usize,
+    query_global_start: usize,
+    ani_threshold: f32,
+) -> usize {
+    const ROW_BLOCK: usize = 32;
+
+    let total_hits = AtomicUsize::new(0);
+    let total_ani_evals = AtomicUsize::new(0);
+    let total_nonpositive_skipped = AtomicUsize::new(0);
+    let row_starts: Vec<usize> = (0..ref_filesketch.len()).step_by(ROW_BLOCK).collect();
+
+    row_starts.into_par_iter().for_each(|i0| {
+        let i1 = (i0 + ROW_BLOCK).min(ref_filesketch.len());
+        let mut local_hits = 0usize;
+        let mut local_pairs_done = 0usize;
+        let mut local_ani_evals = 0usize;
+        let mut local_nonpositive_skipped = 0usize;
+
+        for i in i0..i1 {
+            let global_i = ref_global_start + i;
+
+            for j in 0..query_filesketch.len() {
+                let global_j = query_global_start + j;
+                if if_symmetric && global_i >= global_j {
+                    continue;
+                }
+
+                let r = &ref_filesketch[i];
+                let q = &query_filesketch[j];
+
+                let dot = compute_pairwise_dot_best(&r.hv, &q.hv) as f64;
+                let inter_hat = dot / r.hv_d as f64;
+                if inter_hat <= 0.0 && ani_threshold > 0.0 {
+                    local_nonpositive_skipped += 1;
+                    local_pairs_done += 1;
+                    continue;
+                }
+
+                local_ani_evals += 1;
+                let ani = ani_from_intersection_and_cardinalities(
+                    inter_hat,
+                    ref_cards[i],
+                    query_cards[j],
+                    ksize,
+                );
+
+                if ani >= ani_threshold {
+                    local_hits += 1;
+                }
+
+                local_pairs_done += 1;
+            }
+        }
+
+        total_hits.fetch_add(local_hits, Ordering::Relaxed);
+        total_ani_evals.fetch_add(local_ani_evals, Ordering::Relaxed);
+        total_nonpositive_skipped.fetch_add(local_nonpositive_skipped, Ordering::Relaxed);
+        pb.inc(local_pairs_done as u64);
+    });
+
+    info!(
+        "cpu chunk block breakdown: ref_start={} query_start={} refs={} queries={} hits={} ani_evals={} nonpositive_skipped={}",
+        ref_global_start,
+        query_global_start,
+        ref_filesketch.len(),
+        query_filesketch.len(),
+        total_hits.load(Ordering::Relaxed),
+        total_ani_evals.load(Ordering::Relaxed),
+        total_nonpositive_skipped.load(Ordering::Relaxed)
+    );
+
+    total_hits.load(Ordering::Relaxed)
+}
+
+fn write_count_summary(
+    out_path: &std::path::Path,
+    output_mode: DistOutputMode,
+    refs: usize,
+    queries: usize,
+    pairs: u64,
+    hits: u64,
+    ani_threshold: f32,
+) {
+    let mut writer = BufWriter::new(File::create(out_path).expect("Failed to create count output"));
+    writeln!(writer, "metric\tvalue").expect("Failed to write count output");
+    writeln!(writer, "mode\t{}", output_mode.as_str()).expect("Failed to write count output");
+    writeln!(writer, "refs\t{}", refs).expect("Failed to write count output");
+    writeln!(writer, "queries\t{}", queries).expect("Failed to write count output");
+    writeln!(writer, "pairs\t{}", pairs).expect("Failed to write count output");
+    writeln!(writer, "hits\t{}", hits).expect("Failed to write count output");
+    writeln!(writer, "ani_threshold\t{}", ani_threshold).expect("Failed to write count output");
+    writer.flush().expect("Failed to flush count output");
+}
+
+fn dist_chunked_count_cpu(sketch_dist: &SketchDist, if_symmetric: bool) -> Result<()> {
+    if sketch_dist.output_mode != DistOutputMode::Count {
+        bail!("--dist-mode chunked currently supports only --output-mode count");
+    }
+
+    let tstart = Instant::now();
+    let metadata_start = Instant::now();
+    ensure_chunked_inputs(sketch_dist)?;
+
+    let ref_hd_meta = chunked_sketch::read_hd_metadata(&sketch_dist.path_ref_sketch)?;
+    let ref_ull_meta = chunked_sketch::read_ull_metadata(&sketch_dist.path_ref_ull)?;
+    let query_hd_meta = chunked_sketch::read_hd_metadata(&sketch_dist.path_query_sketch)?;
+    let query_ull_meta = chunked_sketch::read_ull_metadata(&sketch_dist.path_query_ull)?;
+
+    validate_hd_ull_metadata_pair("ref", &ref_hd_meta, &ref_ull_meta)?;
+    validate_hd_ull_metadata_pair("query", &query_hd_meta, &query_ull_meta)?;
+    validate_ref_query_chunked_metadata(
+        &ref_hd_meta,
+        &query_hd_meta,
+        &ref_ull_meta,
+        &query_ull_meta,
+    )?;
+    let metadata_secs = metadata_start.elapsed().as_secs_f32();
+
+    let num_ref_files = ref_hd_meta.header.record_count as usize;
+    let num_query_files = query_hd_meta.header.record_count as usize;
+    let total_pairs_u128 = if if_symmetric {
+        if num_ref_files < 2 {
+            0
+        } else {
+            (num_ref_files as u128) * ((num_ref_files - 1) as u128) / 2
+        }
+    } else {
+        (num_ref_files as u128) * (num_query_files as u128)
+    };
+    let total_pairs = u64::try_from(total_pairs_u128).expect("pair count exceeds u64::MAX");
+    let pb = utils::get_progress_bar(total_pairs as usize);
+    let ksize = ref_hd_meta.header.ksize;
+
+    let mut total_hits = 0usize;
+    let mut chunk_reads = 0usize;
+    let compute_start = Instant::now();
+
+    for query_chunk_idx in 0..query_hd_meta.header.chunk_count {
+        let query_global_start = chunk_global_start(&query_hd_meta, query_chunk_idx);
+        let mut query_hd = chunked_sketch::read_hd_chunk(
+            &sketch_dist.path_query_sketch,
+            &query_hd_meta,
+            query_chunk_idx,
+        )?;
+        let query_ull = chunked_sketch::read_ull_chunk(
+            &sketch_dist.path_query_ull,
+            &query_ull_meta,
+            query_chunk_idx,
+        )?;
+        chunk_reads += 2;
+        validate_hd_ull_chunk_pair("query", query_global_start, &query_hd, &query_ull)?;
+        hd::decompress_file_sketch(&mut query_hd);
+        let query_cards: Vec<f64> = query_ull
+            .par_iter()
+            .map(|s| ull_cardinality_from_state(&s.ull_state))
+            .collect();
+
+        for ref_chunk_idx in 0..ref_hd_meta.header.chunk_count {
+            if if_symmetric && ref_chunk_idx > query_chunk_idx {
+                continue;
+            }
+
+            let ref_global_start = chunk_global_start(&ref_hd_meta, ref_chunk_idx);
+            if if_symmetric && ref_chunk_idx == query_chunk_idx {
+                total_hits += stream_hv_ani_cpu_count_block(
+                    &pb,
+                    &query_hd,
+                    &query_hd,
+                    &query_cards,
+                    &query_cards,
+                    ksize,
+                    if_symmetric,
+                    ref_global_start,
+                    query_global_start,
+                    sketch_dist.ani_threshold,
+                );
+            } else {
+                let mut ref_hd = chunked_sketch::read_hd_chunk(
+                    &sketch_dist.path_ref_sketch,
+                    &ref_hd_meta,
+                    ref_chunk_idx,
+                )?;
+                let ref_ull = chunked_sketch::read_ull_chunk(
+                    &sketch_dist.path_ref_ull,
+                    &ref_ull_meta,
+                    ref_chunk_idx,
+                )?;
+                chunk_reads += 2;
+                validate_hd_ull_chunk_pair("ref", ref_global_start, &ref_hd, &ref_ull)?;
+                hd::decompress_file_sketch(&mut ref_hd);
+                let ref_cards: Vec<f64> = ref_ull
+                    .par_iter()
+                    .map(|s| ull_cardinality_from_state(&s.ull_state))
+                    .collect();
+
+                total_hits += stream_hv_ani_cpu_count_block(
+                    &pb,
+                    &ref_hd,
+                    &query_hd,
+                    &ref_cards,
+                    &query_cards,
+                    ksize,
+                    if_symmetric,
+                    ref_global_start,
+                    query_global_start,
+                    sketch_dist.ani_threshold,
+                );
+            }
+        }
+    }
+
+    pb.finish_and_clear();
+    let compute_secs = compute_start.elapsed().as_secs_f32();
+    let cnt = total_hits as u64;
+    let perc = if total_pairs > 0 {
+        (cnt as f64) / (total_pairs as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    if perc < 5.0 {
+        warn!(
+            "Output ANIs with threshold {:.1} are too divergent: {} of {} ({:.2}%) ANIs are reported",
+            sketch_dist.ani_threshold, cnt, total_pairs, perc
+        );
+    } else {
+        info!(
+            "Output {} of {} ANIs above threshold {:.1} to file {}",
+            cnt,
+            total_pairs,
+            sketch_dist.ani_threshold,
+            sketch_dist.out_file.to_string_lossy()
+        );
+    }
+
+    write_count_summary(
+        sketch_dist.out_file.as_path(),
+        sketch_dist.output_mode,
+        num_ref_files,
+        num_query_files,
+        total_pairs,
+        cnt,
+        sketch_dist.ani_threshold,
+    );
+
+    info!(
+        "chunked cpu dist timings: metadata={:.3}s compute={:.3}s total={:.3}s refs={} queries={} pairs={} hits={} chunk_reads={}",
+        metadata_secs,
+        compute_secs,
+        tstart.elapsed().as_secs_f32(),
+        num_ref_files,
+        num_query_files,
+        total_pairs,
+        cnt,
+        chunk_reads
+    );
+
+    Ok(())
+}
+
+fn ensure_chunked_inputs(sketch_dist: &SketchDist) -> Result<()> {
+    if !chunked_sketch::is_chunked_hd_path(&sketch_dist.path_ref_sketch)? {
+        bail!(
+            "--dist-mode chunked requires chunked reference HD input: {}",
+            sketch_dist.path_ref_sketch.display()
+        );
+    }
+    if !chunked_sketch::is_chunked_ull_path(&sketch_dist.path_ref_ull)? {
+        bail!(
+            "--dist-mode chunked requires chunked reference ULL input: {}",
+            sketch_dist.path_ref_ull.display()
+        );
+    }
+    if !chunked_sketch::is_chunked_hd_path(&sketch_dist.path_query_sketch)? {
+        bail!(
+            "--dist-mode chunked requires chunked query HD input: {}",
+            sketch_dist.path_query_sketch.display()
+        );
+    }
+    if !chunked_sketch::is_chunked_ull_path(&sketch_dist.path_query_ull)? {
+        bail!(
+            "--dist-mode chunked requires chunked query ULL input: {}",
+            sketch_dist.path_query_ull.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_hd_ull_metadata_pair(
+    label: &str,
+    hd_meta: &chunked_sketch::ChunkedMetadata,
+    ull_meta: &chunked_sketch::ChunkedMetadata,
+) -> Result<()> {
+    if hd_meta.header.record_count != ull_meta.header.record_count {
+        bail!(
+            "{} HD/ULL record count mismatch: HD={} ULL={}",
+            label,
+            hd_meta.header.record_count,
+            ull_meta.header.record_count
+        );
+    }
+    if hd_meta.header.chunk_count != ull_meta.header.chunk_count
+        || hd_meta.header.chunk_records != ull_meta.header.chunk_records
+    {
+        bail!(
+            "{} HD/ULL chunk layout mismatch: HD chunks={} chunk_records={} ULL chunks={} chunk_records={}",
+            label,
+            hd_meta.header.chunk_count,
+            hd_meta.header.chunk_records,
+            ull_meta.header.chunk_count,
+            ull_meta.header.chunk_records
+        );
+    }
+    if hd_meta.header.ksize != ull_meta.header.ksize
+        || hd_meta.header.canonical != ull_meta.header.canonical
+        || hd_meta.header.seed != ull_meta.header.seed
+    {
+        bail!(
+            "{} HD/ULL parameter mismatch: HD k={} canonical={} seed={} ULL k={} canonical={} seed={}",
+            label,
+            hd_meta.header.ksize,
+            hd_meta.header.canonical,
+            hd_meta.header.seed,
+            ull_meta.header.ksize,
+            ull_meta.header.canonical,
+            ull_meta.header.seed
+        );
+    }
+    Ok(())
+}
+
+fn validate_ref_query_chunked_metadata(
+    ref_hd: &chunked_sketch::ChunkedMetadata,
+    query_hd: &chunked_sketch::ChunkedMetadata,
+    ref_ull: &chunked_sketch::ChunkedMetadata,
+    query_ull: &chunked_sketch::ChunkedMetadata,
+) -> Result<()> {
+    if ref_hd.header.ksize != query_hd.header.ksize
+        || ref_hd.header.canonical != query_hd.header.canonical
+        || ref_hd.header.seed != query_hd.header.seed
+        || ref_hd.header.scaled != query_hd.header.scaled
+        || ref_hd.header.hv_d != query_hd.header.hv_d
+    {
+        bail!("reference and query HD chunked metadata are incompatible");
+    }
+    if ref_ull.header.ksize != query_ull.header.ksize
+        || ref_ull.header.canonical != query_ull.header.canonical
+        || ref_ull.header.seed != query_ull.header.seed
+        || ref_ull.header.ull_p != query_ull.header.ull_p
+    {
+        bail!("reference and query ULL chunked metadata are incompatible");
+    }
+    Ok(())
+}
+
+fn validate_hd_ull_chunk_pair(
+    label: &str,
+    global_start: usize,
+    hd: &[FileSketch],
+    ull: &[FileUllSketch],
+) -> Result<()> {
+    if hd.len() != ull.len() {
+        bail!(
+            "{} HD/ULL chunk record count mismatch at global start {}: HD={} ULL={}",
+            label,
+            global_start,
+            hd.len(),
+            ull.len()
+        );
+    }
+
+    for (idx, (h, u)) in hd.iter().zip(ull.iter()).enumerate() {
+        if h.file_str != u.file_str {
+            bail!(
+                "{} HD/ULL file order mismatch at record {}: HD={:?} ULL={:?}",
+                label,
+                global_start + idx,
+                h.file_str,
+                u.file_str
+            );
+        }
+    }
+    Ok(())
+}
+
+fn chunk_global_start(metadata: &chunked_sketch::ChunkedMetadata, chunk_idx: u32) -> usize {
+    chunk_idx as usize * metadata.header.chunk_records as usize
 }
 
 #[cfg(feature = "cuda")]
@@ -1102,7 +1506,8 @@ mod tests {
     use super::{ani_from_intersection_and_cardinalities, stream_hv_ani_cpu};
     #[cfg(feature = "cuda")]
     use crate::types::ResidentMatrixMode;
-    use crate::types::{DistOutputMode, FileSketch};
+    use crate::types::{DistMode, DistOutputMode, FileSketch, FileUllSketch, SketchDist};
+    use crate::{chunked_sketch, hd};
     use std::collections::HashSet;
     #[cfg(feature = "cuda")]
     use std::fs::File;
@@ -1110,6 +1515,7 @@ mod tests {
     use std::io::{BufWriter, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use ultraloglog::UltraLogLog;
 
     static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1127,6 +1533,14 @@ mod tests {
         std::env::temp_dir().join(format!("dotani_{label}_{}_{}.ani", std::process::id(), id))
     }
 
+    fn temp_dir(label: &str) -> PathBuf {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("dotani_{label}_{}_{}", std::process::id(), id));
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
     fn test_filesketch(file_str: &str, hv: Vec<i32>) -> FileSketch {
         FileSketch {
             ksize: 1,
@@ -1138,6 +1552,89 @@ mod tests {
             hv_norm_2: 0,
             file_str: file_str.to_string(),
             hv,
+        }
+    }
+
+    fn compressed_test_filesketch(file_str: &str, hv: Vec<i32>) -> FileSketch {
+        let mut sketch = FileSketch {
+            ksize: 1,
+            scaled: 1,
+            canonical: true,
+            seed: 123,
+            hv_d: hv.len(),
+            hv_quant_bits: 0,
+            hv_norm_2: super::compute_hv_l2_norm(&hv),
+            file_str: file_str.to_string(),
+            hv: Vec::new(),
+        };
+        let quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
+        sketch.hv_quant_bits = quant_bits;
+        sketch
+    }
+
+    fn test_ullsketch(file_str: &str, seed: u64) -> FileUllSketch {
+        test_ullsketch_with_p(file_str, seed, 14)
+    }
+
+    fn test_ullsketch_with_p(file_str: &str, seed: u64, ull_p: u32) -> FileUllSketch {
+        let mut ull = UltraLogLog::new(ull_p).expect("Invalid UltraLogLog precision");
+        ull.add(seed);
+        FileUllSketch {
+            ksize: 1,
+            canonical: true,
+            seed: 123,
+            ull_p,
+            file_str: file_str.to_string(),
+            ull_state: ull.get_state().to_vec(),
+        }
+    }
+
+    fn write_chunked_pair(
+        dir: &std::path::Path,
+        stem: &str,
+        hd_records: &[FileSketch],
+        ull_records: &[FileUllSketch],
+        chunk_records: u32,
+    ) -> PathBuf {
+        let hd_path = dir.join(format!("{stem}.sketch"));
+        let ull_path = PathBuf::from(format!("{}.ull", hd_path.to_string_lossy()));
+        chunked_sketch::write_chunked_hd(&hd_path, hd_records, chunk_records)
+            .expect("failed to write chunked HD");
+        chunked_sketch::write_chunked_ull(&ull_path, ull_records, chunk_records)
+            .expect("failed to write chunked ULL");
+        hd_path
+    }
+
+    fn read_count_summary_value(path: &std::path::Path, metric: &str) -> String {
+        std::fs::read_to_string(path)
+            .expect("failed to read count output")
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find_map(|(k, v)| (k == metric).then(|| v.to_string()))
+            .unwrap_or_else(|| panic!("missing metric {metric}"))
+    }
+
+    fn chunked_count_dist(ref_path: PathBuf, query_path: PathBuf, out_path: PathBuf) -> SketchDist {
+        chunked_count_dist_with_threshold(ref_path, query_path, out_path, 0.0)
+    }
+
+    fn chunked_count_dist_with_threshold(
+        ref_path: PathBuf,
+        query_path: PathBuf,
+        out_path: PathBuf,
+        ani_threshold: f32,
+    ) -> SketchDist {
+        SketchDist {
+            path_ref_ull: PathBuf::from(format!("{}.ull", ref_path.to_string_lossy())),
+            path_query_ull: PathBuf::from(format!("{}.ull", query_path.to_string_lossy())),
+            path_ref_sketch: ref_path,
+            path_query_sketch: query_path,
+            out_file: out_path,
+            ani_threshold,
+            threads: 2,
+            dist_mode: DistMode::Chunked,
+            output_mode: DistOutputMode::Count,
+            ..SketchDist::default()
         }
     }
 
@@ -1345,6 +1842,221 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn chunked_count_non_symmetric_matches_full_load_cpu_count() {
+        let dir = temp_dir("chunked_non_symmetric");
+        let refs = vec![
+            compressed_test_filesketch("r0", vec![1; 32]),
+            compressed_test_filesketch("r1", vec![0; 32]),
+        ];
+        let queries = vec![
+            compressed_test_filesketch("q0", vec![1; 32]),
+            compressed_test_filesketch("q1", vec![0; 32]),
+            compressed_test_filesketch("q2", vec![1; 32]),
+        ];
+        let ref_ulls = vec![test_ullsketch("r0", 10), test_ullsketch("r1", 11)];
+        let query_ulls = vec![
+            test_ullsketch("q0", 20),
+            test_ullsketch("q1", 21),
+            test_ullsketch("q2", 22),
+        ];
+        let ref_path = write_chunked_pair(&dir, "ref", &refs, &ref_ulls, 1);
+        let query_path = write_chunked_pair(&dir, "query", &queries, &query_ulls, 2);
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist_with_threshold(
+            ref_path.clone(),
+            query_path.clone(),
+            out.clone(),
+            50.0,
+        );
+
+        super::dist_chunked_count_cpu(&sketch_dist, false).unwrap();
+
+        let mut full_refs = chunked_sketch::load_chunked_hd(&ref_path).unwrap();
+        let mut full_queries = chunked_sketch::load_chunked_hd(&query_path).unwrap();
+        hd::decompress_file_sketch(&mut full_refs);
+        hd::decompress_file_sketch(&mut full_queries);
+        let ref_cards: Vec<f64> = ref_ulls
+            .iter()
+            .map(|s| super::ull_cardinality_from_state(&s.ull_state))
+            .collect();
+        let query_cards: Vec<f64> = query_ulls
+            .iter()
+            .map(|s| super::ull_cardinality_from_state(&s.ull_state))
+            .collect();
+        let full_out = dir.join("full_count.ani");
+        let full_hits = stream_hv_ani_cpu(
+            &full_out,
+            &indicatif::ProgressBar::hidden(),
+            &full_refs,
+            &full_queries,
+            &ref_cards,
+            &query_cards,
+            1,
+            false,
+            50.0,
+            DistOutputMode::Count,
+        );
+
+        assert_eq!(read_count_summary_value(&out, "refs"), "2");
+        assert_eq!(read_count_summary_value(&out, "queries"), "3");
+        assert_eq!(read_count_summary_value(&out, "pairs"), "6");
+        assert_eq!(
+            read_count_summary_value(&out, "hits"),
+            full_hits.to_string()
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_symmetric_preserves_upper_triangle_across_chunks() {
+        let dir = temp_dir("chunked_symmetric");
+        let records = vec![
+            compressed_test_filesketch("s0", vec![1; 32]),
+            compressed_test_filesketch("s1", vec![0; 32]),
+            compressed_test_filesketch("s2", vec![1; 32]),
+            compressed_test_filesketch("s3", vec![0; 32]),
+            compressed_test_filesketch("s4", vec![1; 32]),
+        ];
+        let ulls = vec![
+            test_ullsketch("s0", 30),
+            test_ullsketch("s1", 31),
+            test_ullsketch("s2", 32),
+            test_ullsketch("s3", 33),
+            test_ullsketch("s4", 34),
+        ];
+        let path = write_chunked_pair(&dir, "self", &records, &ulls, 2);
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(path.clone(), path, out.clone());
+
+        super::dist_chunked_count_cpu(&sketch_dist, true).unwrap();
+
+        assert_eq!(read_count_summary_value(&out, "refs"), "5");
+        assert_eq!(read_count_summary_value(&out, "queries"), "5");
+        assert_eq!(read_count_summary_value(&out, "pairs"), "10");
+        assert_eq!(read_count_summary_value(&out, "hits"), "10");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_rejects_rows_mode_before_loading_inputs() {
+        let sketch_dist = SketchDist {
+            dist_mode: DistMode::Chunked,
+            output_mode: DistOutputMode::Rows,
+            ..SketchDist::default()
+        };
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, false).unwrap_err();
+        assert!(err.to_string().contains("only --output-mode count"));
+    }
+
+    #[test]
+    fn chunked_count_rejects_legacy_hd_input() {
+        let dir = temp_dir("chunked_rejects_legacy");
+        let legacy_hd = dir.join("legacy.sketch");
+        std::fs::write(
+            &legacy_hd,
+            bincode::serialize(&Vec::<FileSketch>::new()).unwrap(),
+        )
+        .unwrap();
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(legacy_hd.clone(), legacy_hd, out);
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires chunked reference HD input")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_rejects_legacy_ull_input() {
+        let dir = temp_dir("chunked_rejects_legacy_ull");
+        let records = vec![compressed_test_filesketch("s0", vec![1; 32])];
+        let ulls = vec![test_ullsketch("s0", 40)];
+        let path = write_chunked_pair(&dir, "bad_ull", &records, &ulls, 1);
+        let ull_path = PathBuf::from(format!("{}.ull", path.to_string_lossy()));
+        std::fs::write(
+            &ull_path,
+            bincode::serialize(&Vec::<FileUllSketch>::new()).unwrap(),
+        )
+        .unwrap();
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(path.clone(), path, out);
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires chunked reference ULL input")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_rejects_hd_ull_order_mismatch() {
+        let dir = temp_dir("chunked_order_mismatch");
+        let records = vec![
+            compressed_test_filesketch("s0", vec![1; 32]),
+            compressed_test_filesketch("s1", vec![0; 32]),
+        ];
+        let ulls = vec![test_ullsketch("s1", 41), test_ullsketch("s0", 40)];
+        let path = write_chunked_pair(&dir, "bad", &records, &ulls, 1);
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(path.clone(), path, out);
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, true).unwrap_err();
+        assert!(err.to_string().contains("file order mismatch"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_rejects_ref_query_hd_metadata_mismatch() {
+        let dir = temp_dir("chunked_hd_metadata_mismatch");
+        let refs = vec![compressed_test_filesketch("r0", vec![1; 32])];
+        let queries = vec![compressed_test_filesketch("q0", vec![1; 64])];
+        let ref_ulls = vec![test_ullsketch("r0", 50)];
+        let query_ulls = vec![test_ullsketch("q0", 51)];
+        let ref_path = write_chunked_pair(&dir, "ref", &refs, &ref_ulls, 1);
+        let query_path = write_chunked_pair(&dir, "query", &queries, &query_ulls, 1);
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(ref_path, query_path, out);
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reference and query HD chunked metadata are incompatible")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chunked_count_rejects_ref_query_ull_metadata_mismatch() {
+        let dir = temp_dir("chunked_ull_metadata_mismatch");
+        let refs = vec![compressed_test_filesketch("r0", vec![1; 32])];
+        let queries = vec![compressed_test_filesketch("q0", vec![1; 32])];
+        let ref_ulls = vec![test_ullsketch_with_p("r0", 60, 14)];
+        let query_ulls = vec![test_ullsketch_with_p("q0", 61, 12)];
+        let ref_path = write_chunked_pair(&dir, "ref", &refs, &ref_ulls, 1);
+        let query_path = write_chunked_pair(&dir, "query", &queries, &query_ulls, 1);
+        let out = dir.join("count.tsv");
+        let sketch_dist = chunked_count_dist(ref_path, query_path, out);
+
+        let err = super::dist_chunked_count_cpu(&sketch_dist, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reference and query ULL chunked metadata are incompatible")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "cuda")]
@@ -1843,19 +2555,15 @@ pub fn compute_hv_ani(
         );
     }
     if sketch_dist.output_mode == DistOutputMode::Count {
-        let mut writer = BufWriter::new(
-            File::create(sketch_dist.out_file.as_path()).expect("Failed to create count output"),
+        write_count_summary(
+            sketch_dist.out_file.as_path(),
+            sketch_dist.output_mode,
+            num_ref_files,
+            num_query_files,
+            total_dist,
+            cnt,
+            sketch_dist.ani_threshold,
         );
-        writeln!(writer, "metric\tvalue").expect("Failed to write count output");
-        writeln!(writer, "mode\t{}", sketch_dist.output_mode.as_str())
-            .expect("Failed to write count output");
-        writeln!(writer, "refs\t{}", num_ref_files).expect("Failed to write count output");
-        writeln!(writer, "queries\t{}", num_query_files).expect("Failed to write count output");
-        writeln!(writer, "pairs\t{}", total_dist).expect("Failed to write count output");
-        writeln!(writer, "hits\t{}", cnt).expect("Failed to write count output");
-        writeln!(writer, "ani_threshold\t{}", sketch_dist.ani_threshold)
-            .expect("Failed to write count output");
-        writer.flush().expect("Failed to flush count output");
     }
     let summary_secs = summary_start.elapsed().as_secs_f32();
 

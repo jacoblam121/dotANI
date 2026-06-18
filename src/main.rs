@@ -211,6 +211,14 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("dist_mode")
+                .long("dist-mode")
+                .help("Dist execution mode")
+                .default_value("full")
+                .value_parser(["full", "chunked"])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("output_mode")
                 .long("output-mode")
                 .help("Dist output mode")
@@ -363,6 +371,7 @@ fn main() {
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
+            dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
             resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
@@ -426,6 +435,9 @@ fn main() {
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
             metrics_out: None,
+            dist_mode: types::DistMode::from_cli_value(
+                dist_m.get_one::<String>("dist_mode").unwrap(),
+            ),
             dist_output_mode: types::DistOutputMode::from_cli_value(
                 dist_m.get_one::<String>("output_mode").unwrap(),
             ),
@@ -476,6 +488,7 @@ fn main() {
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
             metrics_out: None,
+            dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
             resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
