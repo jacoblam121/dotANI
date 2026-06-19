@@ -1101,7 +1101,6 @@ fn stream_hv_ani_gpu_multi(
     ani_threshold: f32,
     threads: usize,
     output_mode: DistOutputMode,
-    resident_matrix_mode: ResidentMatrixMode,
 ) -> anyhow::Result<usize> {
     if ref_filesketch.is_empty() || query_filesketch.is_empty() {
         return Ok(0);
@@ -1113,7 +1112,7 @@ fn stream_hv_ani_gpu_multi(
 
     let ng = device_count()?.max(1);
     info!("Using {} GPU worker(s) for tiled dot-product", ng);
-    let use_resident_matrix = if_symmetric && resident_matrix_mode == ResidentMatrixMode::Auto;
+    let use_resident_matrix = if_symmetric;
     let (resident_flat_host, resident_flatten_ns) = if use_resident_matrix {
         let flatten_start = Instant::now();
         let flat = flatten_hv_matrix(ref_filesketch);
@@ -1480,8 +1479,6 @@ fn stream_hv_ani_gpu_multi(
             // Worker timings are aggregate worker-sums; postprocess can exceed wall after pipelining.
             let resident_mode = if !if_symmetric {
                 "disabled"
-            } else if resident_matrix_mode == ResidentMatrixMode::Off {
-                "off"
             } else if breakdown.resident_tiles > 0 && breakdown.resident_fallback_tiles == 0 {
                 "symmetric"
             } else {
@@ -1529,8 +1526,6 @@ mod tests {
     #[cfg(feature = "cuda")]
     use super::stream_hv_ani_gpu_multi;
     use super::{ani_from_intersection_and_cardinalities, stream_hv_ani_cpu};
-    #[cfg(feature = "cuda")]
-    use crate::types::ResidentMatrixMode;
     use crate::types::{
         DistMode, DistOutputFormat, DistOutputMode, FileSketch, FileUllSketch, SketchDist,
     };
@@ -2353,7 +2348,6 @@ mod tests {
             0.0,
             1,
             DistOutputMode::Rows,
-            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -2402,7 +2396,6 @@ mod tests {
             85.0,
             1,
             DistOutputMode::Rows,
-            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute");
         writer.flush().expect("failed to flush output");
@@ -2444,7 +2437,6 @@ mod tests {
             85.0,
             1,
             DistOutputMode::Rows,
-            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute compressed rows");
         writer.flush().expect("failed to flush compressed output");
@@ -2490,7 +2482,6 @@ mod tests {
             85.0,
             1,
             DistOutputMode::Rows,
-            ResidentMatrixMode::Auto,
         )
         .expect("GPU stream should compute rows");
         writer.flush().expect("failed to flush output");
@@ -2511,7 +2502,6 @@ mod tests {
             85.0,
             1,
             DistOutputMode::Count,
-            ResidentMatrixMode::Off,
         )
         .expect("GPU stream should compute count");
 
@@ -2549,7 +2539,6 @@ mod tests {
             0.0,
             1,
             DistOutputMode::Rows,
-            ResidentMatrixMode::Auto,
         )
         .expect("GPU symmetric stream should compute");
         writer.flush().expect("failed to flush output");
@@ -2633,7 +2622,6 @@ pub fn compute_hv_ani(
             sketch_dist.ani_threshold,
             sketch_dist.threads as usize,
             sketch_dist.output_mode,
-            sketch_dist.resident_matrix_mode,
         ) {
             Ok(n) => {
                 let flush_start = Instant::now();

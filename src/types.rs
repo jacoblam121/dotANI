@@ -91,7 +91,6 @@ pub struct CliParams {
     pub dist_mode: DistMode,
     pub dist_output_mode: DistOutputMode,
     pub dist_output_format: DistOutputFormat,
-    pub resident_matrix_mode: ResidentMatrixMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,22 +181,6 @@ impl DistOutputFormat {
         match self {
             Self::Text => "text",
             Self::ZstdText => "zstd-text",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResidentMatrixMode {
-    Auto,
-    Off,
-}
-
-impl ResidentMatrixMode {
-    pub fn from_cli_value(value: &str) -> Self {
-        match value {
-            "auto" => Self::Auto,
-            "off" => Self::Off,
-            _ => panic!("Invalid resident matrix mode: {value}"),
         }
     }
 }
@@ -442,7 +425,6 @@ pub struct SketchDist {
     pub dist_mode: DistMode,
     pub output_mode: DistOutputMode,
     pub output_format: DistOutputFormat,
-    pub resident_matrix_mode: ResidentMatrixMode,
     pub file_ani: Vec<((String, String), f32)>,
 }
 
@@ -461,7 +443,6 @@ impl Default for SketchDist {
             dist_mode: DistMode::Full,
             output_mode: DistOutputMode::Rows,
             output_format: DistOutputFormat::Text,
-            resident_matrix_mode: ResidentMatrixMode::Auto,
             file_ani: Vec::<((String, String), f32)>::new(),
         }
     }
@@ -482,7 +463,6 @@ impl SketchDist {
         new_dist.dist_mode = params.dist_mode;
         new_dist.output_mode = params.dist_output_mode;
         new_dist.output_format = params.dist_output_format;
-        new_dist.resident_matrix_mode = params.resident_matrix_mode;
         new_dist
     }
 }

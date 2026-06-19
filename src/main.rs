@@ -233,14 +233,6 @@ fn main() {
                 .default_value("text")
                 .value_parser(["text", "zstd-text"])
                 .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("resident_matrix")
-                .long("resident-matrix")
-                .help("CUDA symmetric resident matrix mode")
-                .default_value("auto")
-                .value_parser(["auto", "off"])
-                .action(ArgAction::Set),
         );
 
     let search_cmd = Command::new(params::CMD_SEARCH)
@@ -382,7 +374,6 @@ fn main() {
             dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
             dist_output_format: types::DistOutputFormat::Text,
-            resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
 
         let sketch_params = types::SketchParams::new(&cli_params);
@@ -453,9 +444,6 @@ fn main() {
             dist_output_format: types::DistOutputFormat::from_cli_value(
                 dist_m.get_one::<String>("output_format").unwrap(),
             ),
-            resident_matrix_mode: types::ResidentMatrixMode::from_cli_value(
-                dist_m.get_one::<String>("resident_matrix").unwrap(),
-            ),
         };
 
         rayon::ThreadPoolBuilder::new()
@@ -503,7 +491,6 @@ fn main() {
             dist_mode: types::DistMode::Full,
             dist_output_mode: types::DistOutputMode::Rows,
             dist_output_format: types::DistOutputFormat::Text,
-            resident_matrix_mode: types::ResidentMatrixMode::Auto,
         };
 
         rayon::ThreadPoolBuilder::new()
