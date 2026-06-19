@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
-use cudarc::driver::{CudaContext, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaModule, CudaSlice, LaunchConfig, PushKernelArg, sys,
+};
 use cudarc::nvrtc::compile_ptx;
 use std::sync::Arc;
 use std::time::Instant;
@@ -234,6 +236,10 @@ pub struct GpuDotExecutor {
     d_query: Option<CudaSlice<i32>>,
     d_ref: Option<CudaSlice<i32>>,
     d_out: Option<CudaSlice<i64>>,
+    kernel_start: CudaEvent,
+    kernel_end: CudaEvent,
+    d2h_start: CudaEvent,
+    d2h_end: CudaEvent,
 
     cap_query: usize,
     cap_ref: usize,
@@ -251,6 +257,8 @@ pub struct GpuTileTimings {
     pub query_h2d_ns: u128,
     pub ref_h2d_ns: u128,
     pub compute_d2h_ns: u128,
+    pub kernel_event_ns: u128,
+    pub d2h_event_ns: u128,
     pub total_ns: u128,
     pub query_h2d_bytes: usize,
     pub ref_h2d_bytes: usize,
@@ -265,6 +273,11 @@ impl GpuDotExecutor {
         let ctx = CudaContext::new(gpu_id)?;
         let ptx = compile_ptx(KERNEL_SRC)?;
         let module = ctx.load_module(ptx)?;
+        let event_flags = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let kernel_start = ctx.new_event(event_flags)?;
+        let kernel_end = ctx.new_event(event_flags)?;
+        let d2h_start = ctx.new_event(event_flags)?;
+        let d2h_end = ctx.new_event(event_flags)?;
 
         log::debug!(
             "Initialized GPU dot executor on gpu_id={} in {:.3}s",
@@ -279,6 +292,10 @@ impl GpuDotExecutor {
             d_query: None,
             d_ref: None,
             d_out: None,
+            kernel_start,
+            kernel_end,
+            d2h_start,
+            d2h_end,
             cap_query: 0,
             cap_ref: 0,
             cap_out: 0,
@@ -464,9 +481,12 @@ impl GpuDotExecutor {
         launch.arg(&mut *d_out);
 
         let compute_d2h_start = Instant::now();
+        self.kernel_start.record(&stream)?;
         unsafe { launch.launch(cfg) }?;
+        self.kernel_end.record(&stream)?;
 
         // Fast common path: full-size tile matches current capacity.
+        self.d2h_start.record(&stream)?;
         let out_d2h_elems;
         if self.cap_out == out.len() {
             stream.memcpy_dtoh(d_out, out)?;
@@ -478,6 +498,9 @@ impl GpuDotExecutor {
             out.copy_from_slice(&tmp[..out.len()]);
             out_d2h_elems = self.cap_out;
         }
+        self.d2h_end.record(&stream)?;
+        let kernel_event_ns = event_ms_to_ns(self.kernel_start.elapsed_ms(&self.kernel_end)?);
+        let d2h_event_ns = event_ms_to_ns(self.d2h_start.elapsed_ms(&self.d2h_end)?);
         let compute_d2h_ns = compute_d2h_start.elapsed().as_nanos();
 
         log::debug!(
@@ -496,6 +519,8 @@ impl GpuDotExecutor {
             query_h2d_ns,
             ref_h2d_ns,
             compute_d2h_ns,
+            kernel_event_ns,
+            d2h_event_ns,
             total_ns: t0.elapsed().as_nanos(),
             query_h2d_bytes: std::mem::size_of_val(query_hv),
             ref_h2d_bytes: if ref_upload_performed {
@@ -604,8 +629,11 @@ impl GpuDotExecutor {
         launch.arg(&mut *d_out);
 
         let compute_d2h_start = Instant::now();
+        self.kernel_start.record(&stream)?;
         unsafe { launch.launch(cfg) }?;
+        self.kernel_end.record(&stream)?;
 
+        self.d2h_start.record(&stream)?;
         let out_d2h_elems;
         if self.cap_out == out.len() {
             stream.memcpy_dtoh(d_out, out)?;
@@ -616,6 +644,9 @@ impl GpuDotExecutor {
             out.copy_from_slice(&tmp[..out.len()]);
             out_d2h_elems = self.cap_out;
         }
+        self.d2h_end.record(&stream)?;
+        let kernel_event_ns = event_ms_to_ns(self.kernel_start.elapsed_ms(&self.kernel_end)?);
+        let d2h_event_ns = event_ms_to_ns(self.d2h_start.elapsed_ms(&self.d2h_end)?);
         let compute_d2h_ns = compute_d2h_start.elapsed().as_nanos();
 
         log::debug!(
@@ -634,6 +665,8 @@ impl GpuDotExecutor {
             query_h2d_ns: 0,
             ref_h2d_ns: 0,
             compute_d2h_ns,
+            kernel_event_ns,
+            d2h_event_ns,
             total_ns: t0.elapsed().as_nanos(),
             query_h2d_bytes: 0,
             ref_h2d_bytes: 0,
@@ -641,6 +674,11 @@ impl GpuDotExecutor {
             ref_upload_performed: false,
         })
     }
+}
+
+#[inline]
+fn event_ms_to_ns(ms: f32) -> u128 {
+    (ms.max(0.0) as f64 * 1_000_000.0).round() as u128
 }
 
 #[cfg(test)]

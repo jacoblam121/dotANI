@@ -451,7 +451,10 @@ struct DotTileBatch {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
     out_d2h_bytes: usize,
@@ -478,7 +481,10 @@ struct TileBatchResult {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     postprocess_ns: u128,
     query_h2d_bytes: usize,
     ref_h2d_bytes: usize,
@@ -507,7 +513,10 @@ struct GpuStreamBreakdown {
     query_h2d_ns: u128,
     ref_h2d_ns: u128,
     compute_d2h_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
     gpu_tile_total_ns: u128,
+    tile_dots_alloc_ns: u128,
     postprocess_ns: u128,
     gpu_send_blocked_ns: u128,
     postprocess_result_send_blocked_ns: u128,
@@ -521,6 +530,19 @@ struct GpuStreamBreakdown {
     resident_flatten_ns: u128,
     resident_upload_ns: u128,
     resident_upload_bytes: usize,
+    per_gpu: Vec<GpuWorkerStats>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy)]
+struct GpuWorkerStats {
+    gpu_id: usize,
+    wall_ns: u128,
+    tile_count: usize,
+    pair_count: usize,
+    gpu_tile_total_ns: u128,
+    kernel_event_ns: u128,
+    d2h_event_ns: u128,
 }
 
 #[cfg(feature = "cuda")]
@@ -540,7 +562,10 @@ impl GpuStreamBreakdown {
         self.query_h2d_ns += batch.query_h2d_ns;
         self.ref_h2d_ns += batch.ref_h2d_ns;
         self.compute_d2h_ns += batch.compute_d2h_ns;
+        self.kernel_event_ns += batch.kernel_event_ns;
+        self.d2h_event_ns += batch.d2h_event_ns;
         self.gpu_tile_total_ns += batch.gpu_tile_total_ns;
+        self.tile_dots_alloc_ns += batch.tile_dots_alloc_ns;
         self.postprocess_ns += batch.postprocess_ns;
         self.query_h2d_bytes += batch.query_h2d_bytes;
         self.ref_h2d_bytes += batch.ref_h2d_bytes;
@@ -550,6 +575,10 @@ impl GpuStreamBreakdown {
         self.resident_fallback_tiles += batch.resident_fallback_tiles;
         self.resident_upload_ns += batch.resident_upload_ns;
         self.resident_upload_bytes += batch.resident_upload_bytes;
+    }
+
+    fn add_worker(&mut self, stats: GpuWorkerStats) {
+        self.per_gpu.push(stats);
     }
 }
 
@@ -562,6 +591,7 @@ fn ns_to_secs(ns: u128) -> f64 {
 #[cfg(feature = "cuda")]
 enum GpuPipelineMessage {
     Batch(anyhow::Result<TileBatchResult>),
+    Worker(GpuWorkerStats),
 }
 
 #[cfg(feature = "cuda")]
@@ -643,7 +673,10 @@ fn postprocess_dot_tile_batch(
         query_h2d_ns: batch.query_h2d_ns,
         ref_h2d_ns: batch.ref_h2d_ns,
         compute_d2h_ns: batch.compute_d2h_ns,
+        kernel_event_ns: batch.kernel_event_ns,
+        d2h_event_ns: batch.d2h_event_ns,
         gpu_tile_total_ns: batch.gpu_tile_total_ns,
+        tile_dots_alloc_ns: batch.tile_dots_alloc_ns,
         postprocess_ns,
         query_h2d_bytes: batch.query_h2d_bytes,
         ref_h2d_bytes: batch.ref_h2d_bytes,
@@ -774,7 +807,13 @@ fn stream_hv_ani_gpu_multi(
 
             scope.spawn(move || {
                 let worker = || -> anyhow::Result<()> {
+                    let worker_start = Instant::now();
                     let mut gpu = GpuDotExecutor::new(dev_id)?;
+                    let mut worker_tile_count = 0usize;
+                    let mut worker_pair_count = 0usize;
+                    let mut worker_gpu_tile_total_ns = 0u128;
+                    let mut worker_kernel_event_ns = 0u128;
+                    let mut worker_d2h_event_ns = 0u128;
                     let matrix_bytes = resident_flat_host
                         .map(std::mem::size_of_val)
                         .unwrap_or(0);
@@ -854,7 +893,9 @@ fn stream_hv_ani_gpu_multi(
                         let mut resident_tiles = 0usize;
                         let mut resident_fallback_tiles = 0usize;
 
+                        let tile_dots_alloc_start = Instant::now();
                         let mut tile_dots = vec![0i64; nq * nr];
+                        let tile_dots_alloc_ns = tile_dots_alloc_start.elapsed().as_nanos();
                         let gpu_timings = if let Some(resident) = resident_matrix.as_ref() {
                             resident_tiles = 1;
                             gpu.compute_tile_resident(
@@ -912,6 +953,11 @@ fn stream_hv_ani_gpu_multi(
                         } else {
                             nq * nr
                         };
+                        worker_tile_count += 1;
+                        worker_pair_count += num_pairs_done;
+                        worker_gpu_tile_total_ns += gpu_timings.total_ns;
+                        worker_kernel_event_ns += gpu_timings.kernel_event_ns;
+                        worker_d2h_event_ns += gpu_timings.d2h_event_ns;
 
                         let batch = DotTileBatch {
                             job,
@@ -927,7 +973,10 @@ fn stream_hv_ani_gpu_multi(
                             query_h2d_ns: gpu_timings.query_h2d_ns,
                             ref_h2d_ns: gpu_timings.ref_h2d_ns,
                             compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                            kernel_event_ns: gpu_timings.kernel_event_ns,
+                            d2h_event_ns: gpu_timings.d2h_event_ns,
                             gpu_tile_total_ns: gpu_timings.total_ns,
+                            tile_dots_alloc_ns,
                             query_h2d_bytes: gpu_timings.query_h2d_bytes,
                             ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
                             out_d2h_bytes: gpu_timings.out_d2h_bytes,
@@ -958,6 +1007,16 @@ fn stream_hv_ani_gpu_multi(
                         }
                     }
 
+                    let stats = GpuWorkerStats {
+                        gpu_id: dev_id,
+                        wall_ns: worker_start.elapsed().as_nanos(),
+                        tile_count: worker_tile_count,
+                        pair_count: worker_pair_count,
+                        gpu_tile_total_ns: worker_gpu_tile_total_ns,
+                        kernel_event_ns: worker_kernel_event_ns,
+                        d2h_event_ns: worker_d2h_event_ns,
+                    };
+                    let _ = result_tx.send(GpuPipelineMessage::Worker(stats));
                     Ok(())
                 };
 
@@ -997,6 +1056,9 @@ fn stream_hv_ani_gpu_multi(
                     cancel.store(true, Ordering::Relaxed);
                     first_error.get_or_insert(e);
                 }
+                GpuPipelineMessage::Worker(stats) => {
+                    breakdown.add_worker(stats);
+                }
             }
         }
         breakdown.gpu_send_blocked_ns = gpu_send_blocked_ns.load(Ordering::Relaxed) as u128;
@@ -1026,8 +1088,26 @@ fn stream_hv_ani_gpu_multi(
             } else {
                 "fallback"
             };
+            breakdown.per_gpu.sort_by_key(|stats| stats.gpu_id);
+            let per_gpu = breakdown
+                .per_gpu
+                .iter()
+                .map(|stats| {
+                    format!(
+                        "{}:{:.3}s:{}:{}:{:.3}s:{:.3}s:{:.3}s",
+                        stats.gpu_id,
+                        ns_to_secs(stats.wall_ns),
+                        stats.tile_count,
+                        stats.pair_count,
+                        ns_to_secs(stats.gpu_tile_total_ns),
+                        ns_to_secs(stats.kernel_event_ns),
+                        ns_to_secs(stats.d2h_event_ns)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s kernel_cuda_event={:.3}s d2h_cuda_event={:.3}s tile_dots_alloc={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s per_gpu=gid:wall:tiles:pairs:gpu_tile_total:kernel_cuda_event:d2h_cuda_event[{}]",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
@@ -1051,12 +1131,16 @@ fn stream_hv_ani_gpu_multi(
                 ns_to_secs(breakdown.query_h2d_ns),
                 ns_to_secs(breakdown.ref_h2d_ns),
                 ns_to_secs(breakdown.compute_d2h_ns),
+                ns_to_secs(breakdown.kernel_event_ns),
+                ns_to_secs(breakdown.d2h_event_ns),
+                ns_to_secs(breakdown.tile_dots_alloc_ns),
                 ns_to_secs(breakdown.gpu_tile_total_ns),
                 ns_to_secs(breakdown.gpu_send_blocked_ns),
                 ns_to_secs(breakdown.postprocess_ns),
                 ns_to_secs(breakdown.postprocess_result_send_blocked_ns),
                 ns_to_secs(breakdown.write_ns),
                 stream_wall_start.elapsed().as_secs_f64(),
+                per_gpu,
             );
             Ok(total_hits)
         }
@@ -1136,7 +1220,10 @@ mod tests {
             query_h2d_ns: 0,
             ref_h2d_ns: 0,
             compute_d2h_ns: 0,
+            kernel_event_ns: 0,
+            d2h_event_ns: 0,
             gpu_tile_total_ns: 0,
+            tile_dots_alloc_ns: 0,
             query_h2d_bytes: 0,
             ref_h2d_bytes: 0,
             out_d2h_bytes: 0,
