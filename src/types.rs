@@ -86,6 +86,7 @@ pub struct CliParams {
     pub path_query_ull: PathBuf,
 
     pub metrics_out: Option<PathBuf>,
+    pub dist_output_mode: DistOutputMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +108,29 @@ impl CudaDedupStrategy {
         match self {
             Self::HashSet => "hashset",
             Self::SortUnstable => "sort_unstable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistOutputMode {
+    Rows,
+    Count,
+}
+
+impl DistOutputMode {
+    pub fn from_cli_value(value: &str) -> Self {
+        match value {
+            "rows" => Self::Rows,
+            "count" => Self::Count,
+            _ => panic!("Invalid dist output mode: {value}"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Count => "count",
         }
     }
 }
@@ -335,6 +359,7 @@ pub struct SketchDist {
     pub hv_d: usize,
     pub ani_threshold: f32,
     pub threads: u8,
+    pub output_mode: DistOutputMode,
     pub file_ani: Vec<((String, String), f32)>,
 }
 
@@ -350,6 +375,7 @@ impl Default for SketchDist {
             hv_d: 1024,
             ani_threshold: 85.0,
             threads: 1,
+            output_mode: DistOutputMode::Rows,
             file_ani: Vec::<((String, String), f32)>::new(),
         }
     }
@@ -367,6 +393,7 @@ impl SketchDist {
         new_dist.hv_d = params.hv_d;
         new_dist.ani_threshold = params.ani_threshold;
         new_dist.threads = params.threads;
+        new_dist.output_mode = params.dist_output_mode;
         new_dist
     }
 }

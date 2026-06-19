@@ -192,6 +192,14 @@ fn main() {
                 .default_value("85.0")
                 .value_parser(value_parser!(f32))
                 .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("output_mode")
+                .long("output-mode")
+                .help("Dist output mode")
+                .default_value("rows")
+                .value_parser(["rows", "count"])
+                .action(ArgAction::Set),
         );
 
     let search_cmd = Command::new(params::CMD_SEARCH)
@@ -285,6 +293,7 @@ fn main() {
             path_ref_ull: PathBuf::new(),
             path_query_ull: PathBuf::new(),
             metrics_out: sketch_m.get_one::<PathBuf>("metrics_out").cloned(),
+            dist_output_mode: types::DistOutputMode::Rows,
         };
 
         let sketch_params = types::SketchParams::new(&cli_params);
@@ -333,6 +342,9 @@ fn main() {
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
             metrics_out: None,
+            dist_output_mode: types::DistOutputMode::from_cli_value(
+                dist_m.get_one::<String>("output_mode").unwrap(),
+            ),
         };
 
         rayon::ThreadPoolBuilder::new()
@@ -375,6 +387,7 @@ fn main() {
             path_ref_ull: ull_path_from_sketch_path(&path_ref_sketch),
             path_query_ull: ull_path_from_sketch_path(&path_query_sketch),
             metrics_out: None,
+            dist_output_mode: types::DistOutputMode::Rows,
         };
 
         rayon::ThreadPoolBuilder::new()
