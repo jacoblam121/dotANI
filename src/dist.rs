@@ -1237,7 +1237,7 @@ fn stream_hv_ani_gpu_multi(
                 .collect::<Vec<_>>()
                 .join(";");
             info!(
-                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s kernel_cuda_event={:.3}s d2h_cuda_event={:.3}s tile_dots_alloc={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s wall={:.3}s per_gpu=gid:wall:tiles:pairs:gpu_tile_total:kernel_cuda_event:d2h_cuda_event[{}]",
+                "gpu stream breakdown: jobs={} pairs={} hits={} candidates={} prefilter_skipped={} ani_evals={} nonpositive_skipped={} resident_mode={} postprocess_workers={} output_mb={:.3} ref_flatten_events={} ref_uploads={} resident_upload_mb={:.3} query_h2d_mb={:.3} ref_h2d_mb={:.3} out_d2h_mb={:.3} resident_flatten={:.3}s resident_upload={:.3}s flatten_ref_cache_miss={:.3}s flatten_query={:.3}s query_h2d={:.3}s ref_h2d={:.3}s compute_d2h={:.3}s kernel_cuda_event={:.3}s d2h_cuda_event={:.3}s tile_dots_alloc={:.3}s gpu_tile_total={:.3}s gpu_send_blocked={:.3}s postprocess_worker_sum={:.3}s postprocess_result_send_blocked={:.3}s write={:.3}s gpu_pipeline_wall={:.3}s per_gpu=gid:gpu_pipeline_wall:tiles:pairs:gpu_tile_total:kernel_cuda_event:d2h_cuda_event[{}]",
                 breakdown.jobs,
                 breakdown.pairs,
                 breakdown.hits,
