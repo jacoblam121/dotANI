@@ -929,6 +929,20 @@ fn stream_hv_ani_gpu_multi(
                                     ani_threshold,
                                 )?;
                                 let gpu_timings = count_result.timings;
+                                let mut num_hits = count_result.hits;
+                                for pair in &count_result.borderline_pairs {
+                                    let inter_hat =
+                                        pair.dot as f64 / ref_filesketch[pair.ref_index].hv_d as f64;
+                                    let ani = ani_from_intersection_and_cardinalities(
+                                        inter_hat,
+                                        ref_cards[pair.ref_index],
+                                        query_cards[pair.query_index],
+                                        ksize,
+                                    );
+                                    if ani >= ani_threshold {
+                                        num_hits += 1;
+                                    }
+                                }
 
                                 if cancel.load(Ordering::Relaxed) {
                                     break;
@@ -943,7 +957,7 @@ fn stream_hv_ani_gpu_multi(
                                 let result = TileBatchResult {
                                     text: String::new(),
                                     tile_dots: Vec::new(),
-                                    num_hits: count_result.hits,
+                                    num_hits,
                                     num_pairs_done: count_result.pairs,
                                     candidate_pairs: count_result.pairs,
                                     prefilter_skipped: 0,

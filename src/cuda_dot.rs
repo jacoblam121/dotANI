@@ -224,6 +224,12 @@ void dot_rect_count_symmetric_resident(
     int d,
     int ksize,
     float ani_threshold,
+    float transformed_threshold_low,
+    float transformed_threshold_high,
+    unsigned int borderline_capacity,
+    long long* __restrict__ borderline_dots,
+    unsigned int* __restrict__ borderline_refs,
+    unsigned int* __restrict__ borderline_queries,
     unsigned long long* __restrict__ stats
 ) {
     const int tx = threadIdx.x;
@@ -393,26 +399,35 @@ void dot_rect_count_symmetric_resident(
             }
 
             local_ani_evals += 1;
-            double ani = 0.0;
+            bool hit = false;
+            bool borderline = false;
             const double union_hat = ref_cards[g_col] + query_cards[g_row] - inter_hat;
             if (inter_hat > 0.0 && union_hat > 0.0) {
                 const double jaccard = inter_hat / union_hat;
                 if (isfinite(jaccard) && jaccard > 0.0) {
                     if (jaccard > 1.0) {
-                        ani = 100.0;
+                        hit = ani_threshold <= 100.0f;
                     } else {
                         const float jf = (float)jaccard;
                         const float transformed = (2.0f * jf) / (1.0f + jf);
-                        const float ani_f = powf(transformed, 1.0f / (float)ksize);
-                        if (!isnan(ani_f)) {
-                            ani = (double)(fminf(fmaxf(ani_f, 0.0f), 1.0f) * 100.0f);
+                        if (transformed >= transformed_threshold_high) {
+                            hit = true;
+                        } else if (transformed >= transformed_threshold_low) {
+                            borderline = true;
                         }
                     }
                 }
             }
 
-            if (ani >= (double)ani_threshold) {
+            if (ani_threshold <= 0.0f || hit) {
                 local_hits += 1;
+            } else if (borderline) {
+                const unsigned long long border_idx = atomicAdd(&stats[4], 1ULL);
+                if (border_idx < (unsigned long long)borderline_capacity) {
+                    borderline_dots[border_idx] = acc[i][j];
+                    borderline_refs[border_idx] = (unsigned int)global_ref;
+                    borderline_queries[border_idx] = (unsigned int)global_query;
+                }
             }
         }
     }
@@ -468,6 +483,9 @@ pub struct GpuDotExecutor {
     d_ref: Option<CudaSlice<i32>>,
     d_out: Option<CudaSlice<i64>>,
     d_count_stats: Option<CudaSlice<u64>>,
+    d_count_borderline_dots: Option<CudaSlice<i64>>,
+    d_count_borderline_refs: Option<CudaSlice<u32>>,
+    d_count_borderline_queries: Option<CudaSlice<u32>>,
     kernel_start: CudaEvent,
     kernel_end: CudaEvent,
     d2h_start: CudaEvent,
@@ -476,6 +494,7 @@ pub struct GpuDotExecutor {
     cap_query: usize,
     cap_ref: usize,
     cap_out: usize,
+    cap_count_borderline: usize,
 }
 
 pub struct GpuResidentMatrix {
@@ -503,13 +522,21 @@ pub struct GpuTileTimings {
     pub ref_upload_performed: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct GpuCountTileResult {
     pub timings: GpuTileTimings,
     pub pairs: usize,
     pub hits: usize,
     pub ani_evals: usize,
     pub nonpositive_skipped: usize,
+    pub borderline_pairs: Vec<GpuCountBorderlinePair>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GpuCountBorderlinePair {
+    pub ref_index: usize,
+    pub query_index: usize,
+    pub dot: i64,
 }
 
 impl GpuDotExecutor {
@@ -539,6 +566,9 @@ impl GpuDotExecutor {
             d_ref: None,
             d_out: None,
             d_count_stats: None,
+            d_count_borderline_dots: None,
+            d_count_borderline_refs: None,
+            d_count_borderline_queries: None,
             kernel_start,
             kernel_end,
             d2h_start,
@@ -546,6 +576,7 @@ impl GpuDotExecutor {
             cap_query: 0,
             cap_ref: 0,
             cap_out: 0,
+            cap_count_borderline: 0,
         })
     }
 
@@ -600,8 +631,25 @@ impl GpuDotExecutor {
     fn ensure_count_stats(&mut self) -> Result<()> {
         if self.d_count_stats.is_none() {
             let stream = self.ctx.default_stream();
-            self.d_count_stats = Some(stream.alloc_zeros::<u64>(4)?);
+            self.d_count_stats = Some(stream.alloc_zeros::<u64>(5)?);
             log::debug!("gpu_id={} allocate count stats scratch", self.gpu_id);
+        }
+        Ok(())
+    }
+
+    fn ensure_count_borderline_capacity(&mut self, len: usize) -> Result<()> {
+        if self.cap_count_borderline < len {
+            let stream = self.ctx.default_stream();
+            self.d_count_borderline_dots = Some(stream.alloc_zeros::<i64>(len)?);
+            self.d_count_borderline_refs = Some(stream.alloc_zeros::<u32>(len)?);
+            self.d_count_borderline_queries = Some(stream.alloc_zeros::<u32>(len)?);
+            self.cap_count_borderline = len;
+            log::debug!(
+                "gpu_id={} grow count borderline scratch to {} elems ({:.2} MiB)",
+                self.gpu_id,
+                len,
+                mib(len * (std::mem::size_of::<i64>() + 2 * std::mem::size_of::<u32>()))
+            );
         }
         Ok(())
     }
@@ -1017,10 +1065,23 @@ impl GpuDotExecutor {
         let d_ref_cards = ref_cards.d_cards.slice(r0..r0 + nr);
 
         self.ensure_count_stats()?;
+        self.ensure_count_borderline_capacity(nq * nr)?;
         let d_stats = self
             .d_count_stats
             .as_mut()
             .context("internal error: d_count_stats missing after allocation")?;
+        let d_borderline_dots = self
+            .d_count_borderline_dots
+            .as_mut()
+            .context("internal error: d_count_borderline_dots missing after allocation")?;
+        let d_borderline_refs = self
+            .d_count_borderline_refs
+            .as_mut()
+            .context("internal error: d_count_borderline_refs missing after allocation")?;
+        let d_borderline_queries = self
+            .d_count_borderline_queries
+            .as_mut()
+            .context("internal error: d_count_borderline_queries missing after allocation")?;
         stream.memset_zeros(&mut *d_stats)?;
 
         const BLOCK_M: usize = 64;
@@ -1046,6 +1107,15 @@ impl GpuDotExecutor {
         let nr_i32 = nr as i32;
         let d_i32 = query.hv_d as i32;
         let ksize_i32 = ksize as i32;
+        let transformed_threshold = if ani_threshold <= 0.0 {
+            0.0
+        } else {
+            (ani_threshold / 100.0).powf(ksize as f32)
+        };
+        const COUNT_BORDERLINE_BAND: f32 = 1.0e-6;
+        let transformed_threshold_low = (transformed_threshold - COUNT_BORDERLINE_BAND).max(0.0);
+        let transformed_threshold_high = transformed_threshold + COUNT_BORDERLINE_BAND;
+        let borderline_capacity = (nq * nr) as u32;
 
         let mut launch = stream.launch_builder(&func);
         launch.arg(&d_query);
@@ -1059,6 +1129,12 @@ impl GpuDotExecutor {
         launch.arg(&d_i32);
         launch.arg(&ksize_i32);
         launch.arg(&ani_threshold);
+        launch.arg(&transformed_threshold_low);
+        launch.arg(&transformed_threshold_high);
+        launch.arg(&borderline_capacity);
+        launch.arg(&mut *d_borderline_dots);
+        launch.arg(&mut *d_borderline_refs);
+        launch.arg(&mut *d_borderline_queries);
         launch.arg(&mut *d_stats);
 
         let compute_d2h_start = Instant::now();
@@ -1066,13 +1142,48 @@ impl GpuDotExecutor {
         unsafe { launch.launch(cfg) }?;
         self.kernel_end.record(&stream)?;
 
-        let mut stats = [0u64; 4];
+        let mut stats = [0u64; 5];
         self.d2h_start.record(&stream)?;
         stream.memcpy_dtoh(&*d_stats, &mut stats)?;
+        let borderline_count = stats[4] as usize;
+        if borderline_count > nq * nr {
+            bail!(
+                "resident count borderline overflow: count={} capacity={}",
+                borderline_count,
+                nq * nr
+            );
+        }
+        let mut borderline_dots = vec![0_i64; borderline_count];
+        let mut borderline_refs = vec![0_u32; borderline_count];
+        let mut borderline_queries = vec![0_u32; borderline_count];
+        if borderline_count > 0 {
+            stream.memcpy_dtoh(
+                &d_borderline_dots.slice(0..borderline_count),
+                &mut borderline_dots,
+            )?;
+            stream.memcpy_dtoh(
+                &d_borderline_refs.slice(0..borderline_count),
+                &mut borderline_refs,
+            )?;
+            stream.memcpy_dtoh(
+                &d_borderline_queries.slice(0..borderline_count),
+                &mut borderline_queries,
+            )?;
+        }
         self.d2h_end.record(&stream)?;
         let kernel_event_ns = event_ms_to_ns(self.kernel_start.elapsed_ms(&self.kernel_end)?);
         let d2h_event_ns = event_ms_to_ns(self.d2h_start.elapsed_ms(&self.d2h_end)?);
         let compute_d2h_ns = compute_d2h_start.elapsed().as_nanos();
+        let borderline_pairs = borderline_dots
+            .into_iter()
+            .zip(borderline_refs)
+            .zip(borderline_queries)
+            .map(|((dot, ref_index), query_index)| GpuCountBorderlinePair {
+                ref_index: ref_index as usize,
+                query_index: query_index as usize,
+                dot,
+            })
+            .collect::<Vec<_>>();
 
         log::debug!(
             "GPU resident count tile done on gpu_id={} q0={} nq={} r0={} nr={} d={} in {:.3}s",
@@ -1095,13 +1206,16 @@ impl GpuDotExecutor {
                 total_ns: t0.elapsed().as_nanos(),
                 query_h2d_bytes: 0,
                 ref_h2d_bytes: 0,
-                out_d2h_bytes: stats.len() * std::mem::size_of::<u64>(),
+                out_d2h_bytes: stats.len() * std::mem::size_of::<u64>()
+                    + borderline_count
+                        * (std::mem::size_of::<i64>() + 2 * std::mem::size_of::<u32>()),
                 ref_upload_performed: false,
             },
             pairs: stats[0] as usize,
             hits: stats[1] as usize,
             ani_evals: stats[2] as usize,
             nonpositive_skipped: stats[3] as usize,
+            borderline_pairs,
         })
     }
 }
@@ -1143,6 +1257,22 @@ mod tests {
         nr: usize,
         threshold: f32,
     ) -> super::GpuCountTileResult {
+        resident_count_with_ksize(gpu, matrix, cards, rows, d, q0, nq, r0, nr, 1, threshold)
+    }
+
+    fn resident_count_with_ksize(
+        gpu: &mut GpuDotExecutor,
+        matrix: &[i32],
+        cards: &[f64],
+        rows: usize,
+        d: usize,
+        q0: usize,
+        nq: usize,
+        r0: usize,
+        nr: usize,
+        ksize: u8,
+        threshold: f32,
+    ) -> super::GpuCountTileResult {
         let resident = gpu
             .upload_resident_matrix(matrix, rows, d)
             .expect("resident matrix upload");
@@ -1158,7 +1288,7 @@ mod tests {
             &resident_cards,
             r0,
             nr,
-            1,
+            ksize,
             threshold,
         )
         .expect("resident count tile should compute")
@@ -1299,7 +1429,7 @@ mod tests {
         assert_eq!(result.hits, 3);
         assert_eq!(result.ani_evals, 3);
         assert_eq!(result.nonpositive_skipped, 0);
-        assert_eq!(result.timings.out_d2h_bytes, 4 * std::mem::size_of::<u64>());
+        assert_eq!(result.timings.out_d2h_bytes, 5 * std::mem::size_of::<u64>());
     }
 
     #[test]
@@ -1347,6 +1477,59 @@ mod tests {
         assert_eq!(result.hits, 1);
         assert_eq!(result.ani_evals, 1);
         assert_eq!(result.nonpositive_skipped, 0);
+    }
+
+    #[test]
+    fn resident_count_matches_host_near_ani_threshold_with_realistic_ksize() {
+        let mut gpu = GpuDotExecutor::new(0).expect("GPU executor");
+        let ksize = 21;
+        let threshold = 85.0;
+        let dot = 4096_i64;
+        let d = 4_usize;
+        let inter_hat = dot as f64 / d as f64;
+        let target = 0.85_f64.powi(ksize as i32);
+        let mut card = inter_hat / target;
+
+        for step in 0..10_000 {
+            let candidate = card * (1.0 + step as f64 * 1.0e-8);
+            let ani = crate::dist::ani_from_intersection_and_cardinalities(
+                inter_hat, candidate, candidate, ksize,
+            );
+            if (threshold..=threshold + 0.0001).contains(&ani) {
+                card = candidate;
+                break;
+            }
+        }
+
+        let host_ani =
+            crate::dist::ani_from_intersection_and_cardinalities(inter_hat, card, card, ksize);
+        assert!(
+            host_ani >= threshold,
+            "test setup should produce a host hit, got {host_ani}"
+        );
+
+        let matrix = [4096, 0, 0, 0, 1, 0, 0, 0];
+        let cards = [card, card];
+        let result = resident_count_with_ksize(
+            &mut gpu, &matrix, &cards, 2, d, 0, 2, 0, 2, ksize, threshold,
+        );
+
+        assert_eq!(result.pairs, 1);
+        let host_rechecked_hits = result.hits
+            + result
+                .borderline_pairs
+                .iter()
+                .filter(|pair| {
+                    let inter_hat = pair.dot as f64 / d as f64;
+                    crate::dist::ani_from_intersection_and_cardinalities(
+                        inter_hat,
+                        cards[pair.ref_index],
+                        cards[pair.query_index],
+                        ksize,
+                    ) >= threshold
+                })
+                .count();
+        assert_eq!(host_rechecked_hits, 1, "host ANI was {host_ani}");
     }
 
     #[test]
