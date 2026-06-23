@@ -468,6 +468,7 @@ struct DotTileBatch {
 #[cfg(feature = "cuda")]
 struct TileBatchResult {
     text: String,
+    tile_dots: Vec<i64>,
     num_hits: usize,
     num_pairs_done: usize,
     candidate_pairs: usize,
@@ -660,6 +661,7 @@ fn postprocess_dot_tile_batch(
 
     TileBatchResult {
         text,
+        tile_dots: batch.tile_dots,
         num_hits,
         num_pairs_done,
         candidate_pairs: num_pairs_done,
@@ -751,6 +753,8 @@ fn stream_hv_ani_gpu_multi(
     let postprocess_result_send_blocked_ns = Arc::new(AtomicU64::new(0));
     let (work_tx, work_rx) = channel::bounded::<DotTileBatch>(work_queue_capacity);
     let (result_tx, result_rx) = channel::bounded::<GpuPipelineMessage>(result_queue_capacity);
+    let (tile_dots_pool_tx, tile_dots_pool_rx) =
+        channel::bounded::<Vec<i64>>(work_queue_capacity + ng);
 
     std::thread::scope(|scope| -> anyhow::Result<usize> {
         for _ in 0..postprocess_workers {
@@ -804,6 +808,7 @@ fn stream_hv_ani_gpu_multi(
             let cancel = Arc::clone(&cancel);
             let gpu_send_blocked_ns = Arc::clone(&gpu_send_blocked_ns);
             let resident_flat_host = resident_flat_host;
+            let tile_dots_pool_rx = tile_dots_pool_rx.clone();
 
             scope.spawn(move || {
                 let worker = || -> anyhow::Result<()> {
@@ -817,25 +822,40 @@ fn stream_hv_ani_gpu_multi(
                     let matrix_bytes = resident_flat_host
                         .map(std::mem::size_of_val)
                         .unwrap_or(0);
+                    let card_bytes = if resident_flat_host.is_some() {
+                        std::mem::size_of_val(ref_cards)
+                    } else {
+                        0
+                    };
                     let max_tile_out_bytes =
                         tile_query * tile_ref * std::mem::size_of::<i64>();
                     let safety_bytes = 128usize * 1024 * 1024;
                     let mut resident_upload_ns_pending = 0u128;
                     let mut resident_upload_bytes_pending = 0usize;
-                    let resident_matrix = if let Some(flat) = resident_flat_host {
+                    let resident_bundle = if let Some(flat) = resident_flat_host {
                         match gpu.free_memory_bytes() {
                             Ok(free_vram)
                                 if free_vram
-                                    > matrix_bytes + max_tile_out_bytes + safety_bytes =>
+                                    > matrix_bytes + card_bytes + max_tile_out_bytes + safety_bytes =>
                             {
                                 let upload_start = Instant::now();
                                 match gpu.upload_resident_matrix(flat, ref_filesketch.len(), hv_d) {
-                                    Ok(matrix) => {
-                                        resident_upload_ns_pending =
-                                            upload_start.elapsed().as_nanos();
-                                        resident_upload_bytes_pending = matrix_bytes;
-                                        Some(matrix)
-                                    }
+                                    Ok(matrix) => match gpu.upload_resident_cards(ref_cards) {
+                                        Ok(cards) => {
+                                            resident_upload_ns_pending =
+                                                upload_start.elapsed().as_nanos();
+                                            resident_upload_bytes_pending =
+                                                matrix_bytes + card_bytes;
+                                            Some((matrix, cards))
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "GPU worker {} resident card upload failed, falling back to tiled path: {e:?}",
+                                                dev_id
+                                            );
+                                            None
+                                        }
+                                    },
                                     Err(e) => {
                                         warn!(
                                             "GPU worker {} resident matrix upload failed, falling back to tiled path: {e:?}",
@@ -850,7 +870,7 @@ fn stream_hv_ani_gpu_multi(
                                     "GPU worker {} free VRAM insufficient for resident symmetric matrix, falling back to tiled path: free_mb={:.1} required_mb={:.1}",
                                     dev_id,
                                     free_vram as f64 / (1024.0 * 1024.0),
-                                    (matrix_bytes + max_tile_out_bytes + safety_bytes) as f64
+                                    (matrix_bytes + card_bytes + max_tile_out_bytes + safety_bytes) as f64
                                         / (1024.0 * 1024.0)
                                 );
                                 None
@@ -893,10 +913,102 @@ fn stream_hv_ani_gpu_multi(
                         let mut resident_tiles = 0usize;
                         let mut resident_fallback_tiles = 0usize;
 
+                        if output_mode == DistOutputMode::Count {
+                            if let Some((resident, resident_cards)) = resident_bundle.as_ref() {
+                                resident_tiles = 1;
+                                let count_result = gpu.compute_count_tile_symmetric_resident(
+                                    resident,
+                                    resident_cards,
+                                    job.j0,
+                                    nq,
+                                    resident,
+                                    resident_cards,
+                                    job.i0,
+                                    nr,
+                                    ksize,
+                                    ani_threshold,
+                                )?;
+                                let gpu_timings = count_result.timings;
+
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                worker_tile_count += 1;
+                                worker_pair_count += count_result.pairs;
+                                worker_gpu_tile_total_ns += gpu_timings.total_ns;
+                                worker_kernel_event_ns += gpu_timings.kernel_event_ns;
+                                worker_d2h_event_ns += gpu_timings.d2h_event_ns;
+
+                                let result = TileBatchResult {
+                                    text: String::new(),
+                                    tile_dots: Vec::new(),
+                                    num_hits: count_result.hits,
+                                    num_pairs_done: count_result.pairs,
+                                    candidate_pairs: count_result.pairs,
+                                    prefilter_skipped: 0,
+                                    ani_evals: count_result.ani_evals,
+                                    nonpositive_skipped: count_result.nonpositive_skipped,
+                                    text_bytes: 0,
+                                    ref_flatten_events: 0,
+                                    flatten_ref_ns: 0,
+                                    flatten_query_ns: 0,
+                                    query_h2d_ns: gpu_timings.query_h2d_ns,
+                                    ref_h2d_ns: gpu_timings.ref_h2d_ns,
+                                    compute_d2h_ns: gpu_timings.compute_d2h_ns,
+                                    kernel_event_ns: gpu_timings.kernel_event_ns,
+                                    d2h_event_ns: gpu_timings.d2h_event_ns,
+                                    gpu_tile_total_ns: gpu_timings.total_ns,
+                                    tile_dots_alloc_ns: 0,
+                                    postprocess_ns: 0,
+                                    query_h2d_bytes: gpu_timings.query_h2d_bytes,
+                                    ref_h2d_bytes: gpu_timings.ref_h2d_bytes,
+                                    out_d2h_bytes: gpu_timings.out_d2h_bytes,
+                                    ref_uploads: usize::from(gpu_timings.ref_upload_performed),
+                                    resident_tiles,
+                                    resident_fallback_tiles,
+                                    resident_upload_ns: std::mem::take(
+                                        &mut resident_upload_ns_pending,
+                                    ),
+                                    resident_upload_bytes: std::mem::take(
+                                        &mut resident_upload_bytes_pending,
+                                    ),
+                                };
+
+                                let send_start = Instant::now();
+                                match result_tx.send(GpuPipelineMessage::Batch(Ok(result))) {
+                                    Ok(()) => {
+                                        let blocked_ns = send_start.elapsed().as_nanos();
+                                        gpu_send_blocked_ns.fetch_add(
+                                            blocked_ns.min(u64::MAX as u128) as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    Err(_) if cancel.load(Ordering::Relaxed) => break,
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
+                                            "result queue closed unexpectedly: {e}"
+                                        ));
+                                    }
+                                }
+
+                                continue;
+                            }
+                        }
+
                         let tile_dots_alloc_start = Instant::now();
-                        let mut tile_dots = vec![0i64; nq * nr];
+                        let tile_len = nq * nr;
+                        let mut tile_dots = match tile_dots_pool_rx.try_recv() {
+                            Ok(mut tile_dots) => {
+                                tile_dots.resize(tile_len, 0);
+                                tile_dots
+                            }
+                            Err(_) => vec![0i64; tile_len],
+                        };
                         let tile_dots_alloc_ns = tile_dots_alloc_start.elapsed().as_nanos();
-                        let gpu_timings = if let Some(resident) = resident_matrix.as_ref() {
+                        let gpu_timings = if let Some((resident, _resident_cards)) =
+                            resident_bundle.as_ref()
+                        {
                             resident_tiles = 1;
                             gpu.compute_tile_resident(
                                 resident,
@@ -1039,7 +1151,7 @@ fn stream_hv_ani_gpu_multi(
 
         while let Ok(message) = result_rx.recv() {
             match message {
-                GpuPipelineMessage::Batch(Ok(batch)) => {
+                GpuPipelineMessage::Batch(Ok(mut batch)) => {
                     received_jobs += 1;
                     let write_start = Instant::now();
                     if let Some(writer) = writer.as_deref_mut() {
@@ -1051,6 +1163,10 @@ fn stream_hv_ani_gpu_multi(
                     total_hits += batch.num_hits;
                     pb.inc(batch.num_pairs_done as u64);
                     breakdown.add_batch(&batch);
+                    let tile_dots = std::mem::take(&mut batch.tile_dots);
+                    if !tile_dots.is_empty() {
+                        let _ = tile_dots_pool_tx.try_send(tile_dots);
+                    }
                 }
                 GpuPipelineMessage::Batch(Err(e)) => {
                     cancel.store(true, Ordering::Relaxed);
@@ -1723,6 +1839,61 @@ mod tests {
                 "s1\ts2\t0.000".to_string(),
             ])
         );
+
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_stream_symmetric_count_mode_matches_rows_hit_count() {
+        let sketches = vec![
+            test_filesketch("s0", vec![4, 0, 0, 0]),
+            test_filesketch("s1", vec![0, 4, 0, 0]),
+            test_filesketch("s2", vec![4, 0, 0, 0]),
+        ];
+        let cards = vec![100.0, 100.0, 100.0];
+        let out = temp_ani_path("gpu_symmetric_rows_count_compare");
+        let pb = indicatif::ProgressBar::hidden();
+        let mut writer = BufWriter::new(File::create(&out).expect("failed to create output"));
+
+        let row_hits = stream_hv_ani_gpu_multi(
+            Some(&mut writer),
+            &pb,
+            &sketches,
+            &sketches,
+            &cards,
+            &cards,
+            1,
+            true,
+            0.0,
+            1,
+            DistOutputMode::Rows,
+        )
+        .expect("GPU symmetric rows should compute");
+        writer.flush().expect("failed to flush output");
+        let row_count = std::fs::read_to_string(&out)
+            .expect("failed to read rows output")
+            .lines()
+            .count();
+
+        let count_hits = stream_hv_ani_gpu_multi(
+            None,
+            &pb,
+            &sketches,
+            &sketches,
+            &cards,
+            &cards,
+            1,
+            true,
+            0.0,
+            1,
+            DistOutputMode::Count,
+        )
+        .expect("GPU symmetric count should compute");
+
+        assert_eq!(row_hits, 3);
+        assert_eq!(row_count, row_hits);
+        assert_eq!(count_hits, row_hits);
 
         let _ = std::fs::remove_file(out);
     }
