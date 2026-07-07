@@ -52,6 +52,14 @@ struct IndexedSketchResult {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone)]
+struct CudaSketchDevice {
+    dev_id: usize,
+    ctx: Arc<CudaContext>,
+    module: Arc<CudaModule>,
+}
+
+#[cfg(feature = "cuda")]
 struct CudaSketchLaneScratch {
     lane_id: usize,
     dev_id: usize,
@@ -87,10 +95,14 @@ struct CudaSketchLaneScratch {
 
 #[cfg(feature = "cuda")]
 impl CudaSketchLaneScratch {
-    fn new(lane_id: usize, dev_id: usize) -> Result<Self> {
-        let ctx = CudaContext::new(dev_id)?;
-        let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))?;
-        let stream = ctx.default_stream();
+    fn new(
+        lane_id: usize,
+        dev_id: usize,
+        ctx: Arc<CudaContext>,
+        module: Arc<CudaModule>,
+    ) -> Result<Self> {
+        ctx.bind_to_thread()?;
+        let stream = ctx.new_stream()?;
         let kmer_fn = module.load_function("cuda_kmer_t1ha2")?;
         let hd_fn = module.load_function("cuda_hd_encode_counts_direct")?;
         let event_flags = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
@@ -209,6 +221,22 @@ pub fn sketch_cuda(params: SketchParams) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn build_cuda_sketch_devices(device_ids: &[usize]) -> Result<Vec<CudaSketchDevice>> {
+    device_ids
+        .iter()
+        .map(|&dev_id| {
+            let ctx = CudaContext::new(dev_id)?;
+            let module = ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))?;
+            Ok(CudaSketchDevice {
+                dev_id,
+                ctx,
+                module,
+            })
+        })
+        .collect()
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "cuda"))]
 pub fn sketch_cuda(params: SketchParams) -> Result<()> {
     let sketch_wall_start = Instant::now();
@@ -244,6 +272,7 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
 
     let device_ids =
         visible_cuda_device_ids().expect("Failed to find visible CUDA devices for GPU sketching");
+    let devices = build_cuda_sketch_devices(&device_ids)?;
     let lane_count = (params.threads as usize).max(1).min(n_file);
     info!(
         "Using {} GPU worker host lane(s) for sketching across {} usable CUDA device(s)",
@@ -267,7 +296,7 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
 
     std::thread::scope(|scope| {
         for lane_id in 0..lane_count {
-            let dev_id = device_ids[lane_id % device_ids.len()];
+            let device = devices[lane_id % devices.len()].clone();
             let inputs = &inputs;
             let params = &params;
             let next_file = Arc::clone(&next_file);
@@ -277,7 +306,12 @@ pub fn sketch_cuda(params: SketchParams) -> Result<()> {
 
             scope.spawn(move || {
                 let worker = || -> Result<()> {
-                    let mut scratch = CudaSketchLaneScratch::new(lane_id, dev_id)?;
+                    let mut scratch = CudaSketchLaneScratch::new(
+                        lane_id,
+                        device.dev_id,
+                        Arc::clone(&device.ctx),
+                        Arc::clone(&device.module),
+                    )?;
 
                     loop {
                         if stop_workers.load(Ordering::Relaxed) {
