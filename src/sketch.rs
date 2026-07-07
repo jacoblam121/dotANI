@@ -1,8 +1,9 @@
 use log::info;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
+use anyhow::Result;
 use needletail::{Sequence, parse_fastx_file};
 use rayon::prelude::*;
 
@@ -11,17 +12,17 @@ use crate::{dist, hd, utils};
 use ultraloglog::UltraLogLog;
 
 #[cfg(target_arch = "x86_64")]
-pub fn sketch(params: SketchParams) {
+pub fn sketch(params: SketchParams) -> Result<()> {
     let sketch_wall_start = Instant::now();
-    let files = utils::get_fasta_files(&params.path);
-    let n_file = files.len();
+    let inputs = utils::get_sketch_inputs(&params)?;
+    let n_file = inputs.len();
 
     info!("Start sketching...");
     let pb = utils::get_progress_bar(n_file);
 
-    let results: Vec<(FileSketch, Option<FileUllSketch>, FileSketchMetrics)> = files
+    let results: Vec<(FileSketch, Option<FileUllSketch>, FileSketchMetrics)> = inputs
         .par_iter()
-        .map(|file| {
+        .map(|input| {
             let worker_start = Instant::now();
             let mut sketch = FileSketch {
                 ksize: params.ksize,
@@ -31,12 +32,12 @@ pub fn sketch(params: SketchParams) {
                 hv_d: params.hv_d,
                 hv_quant_bits: 16u8,
                 hv_norm_2: 0,
-                file_str: file.display().to_string(),
+                file_str: input.file_id.clone(),
                 hv: Vec::<i32>::new(),
             };
 
             let (kmer_hash_set, ull, mut metrics) =
-                extract_kmer_hash_and_ull(&sketch, params.ull_p);
+                extract_kmer_hash_and_ull(&input.read_path, &sketch, params.ull_p);
             metrics.file = sketch.file_str.clone();
             metrics.unique_hashes = kmer_hash_set.len();
 
@@ -68,7 +69,7 @@ pub fn sketch(params: SketchParams) {
                     canonical: params.canonical,
                     seed: params.seed,
                     ull_p: params.ull_p,
-                    file_str: file.display().to_string(),
+                    file_str: sketch.file_str.clone(),
                     ull_state: ull.get_state().to_vec(),
                 })
             } else {
@@ -107,9 +108,12 @@ pub fn sketch(params: SketchParams) {
     if let Some(prefix) = &params.metrics_out {
         utils::dump_sketch_metrics(&all_metrics, prefix, sketch_wall_start.elapsed().as_nanos());
     }
+
+    Ok(())
 }
 
 fn extract_kmer_hash_and_ull(
+    read_path: &Path,
     sketch: &FileSketch,
     ull_p: u32,
 ) -> (HashSet<u64>, UltraLogLog, FileSketchMetrics) {
@@ -118,8 +122,7 @@ fn extract_kmer_hash_and_ull(
     let mut metrics = FileSketchMetrics::default();
 
     let start = Instant::now();
-    let mut fastx_reader = parse_fastx_file(PathBuf::from(sketch.file_str.clone()))
-        .expect("Opening .fna files failed");
+    let mut fastx_reader = parse_fastx_file(read_path).expect("Opening .fna files failed");
     metrics.fasta_ns = start.elapsed().as_nanos();
 
     let mut hash_set = HashSet::<u64>::new();

@@ -61,6 +61,7 @@ pub unsafe fn mm_hash64_avx2(kmer: __m256i) -> __m256i {
 pub struct CliParams {
     pub mode: String,
     pub path: PathBuf,
+    pub manifest: Option<PathBuf>,
     pub path_ref_sketch: PathBuf,
     pub path_query_sketch: PathBuf,
     pub out_file: PathBuf,
@@ -78,6 +79,7 @@ pub struct CliParams {
 
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -137,6 +139,7 @@ impl DistOutputMode {
 
 pub struct SketchParams {
     pub path: PathBuf,
+    pub manifest: Option<PathBuf>,
     pub out_file: PathBuf,
     pub sketch_method: String,
     pub canonical: bool,
@@ -149,6 +152,7 @@ pub struct SketchParams {
     pub if_compressed: bool,
     pub threads: u8,
     pub cuda_dedup_strategy: CudaDedupStrategy,
+    pub max_readers: Option<usize>,
 
     pub if_ull: bool,
     pub ull_p: u32,
@@ -160,6 +164,7 @@ impl Default for SketchParams {
     fn default() -> Self {
         SketchParams {
             path: PathBuf::new(),
+            manifest: None,
             out_file: PathBuf::new(),
             sketch_method: String::from("t1ha2"),
             canonical: true,
@@ -172,6 +177,7 @@ impl Default for SketchParams {
             if_compressed: true,
             threads: 1,
             cuda_dedup_strategy: CudaDedupStrategy::HashSet,
+            max_readers: None,
 
             if_ull: false,
             ull_p: 14,
@@ -185,6 +191,7 @@ impl SketchParams {
     pub fn new(params: &CliParams) -> SketchParams {
         let mut new_sketch = SketchParams::default();
         new_sketch.path = params.path.clone();
+        new_sketch.manifest = params.manifest.clone();
         new_sketch.out_file = params.out_file.clone();
         new_sketch.sketch_method = params.sketch_method.clone();
         new_sketch.canonical = params.canonical;
@@ -197,6 +204,7 @@ impl SketchParams {
         new_sketch.if_compressed = params.if_compressed;
         new_sketch.threads = params.threads;
         new_sketch.cuda_dedup_strategy = params.cuda_dedup_strategy;
+        new_sketch.max_readers = params.max_readers;
 
         new_sketch.if_ull = params.if_ull;
         new_sketch.ull_p = params.ull_p;
@@ -207,6 +215,12 @@ impl SketchParams {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SketchInput {
+    pub read_path: PathBuf,
+    pub file_id: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FileSketchMetrics {
     pub file: String,
@@ -214,6 +228,7 @@ pub struct FileSketchMetrics {
     pub hashes_seen: usize,
     pub unique_hashes: usize,
     pub fasta_ns: u128,
+    pub fasta_wait_ns: u128,
     pub hash_and_dedup_ns: u128,
     pub hd_encode_ns: u128,
     pub hv_norm_ns: u128,
@@ -223,16 +238,23 @@ pub struct FileSketchMetrics {
     pub cuda_stream_lane: Option<usize>,
     pub cuda_device_id: Option<usize>,
     pub cuda_h2d_ns: Option<u128>,
+    pub cuda_h2d_event_ns: Option<u128>,
     pub cuda_alloc_ns: Option<u128>,
     pub cuda_launch_ns: Option<u128>,
+    pub cuda_kernel_event_ns: Option<u128>,
     pub cuda_d2h_ns: Option<u128>,
+    pub cuda_d2h_event_ns: Option<u128>,
     pub cuda_zero_filter_ns: Option<u128>,
     pub cuda_filter_ns: Option<u128>,
     pub cuda_hd_hash_h2d_ns: Option<u128>,
+    pub cuda_hd_hash_h2d_event_ns: Option<u128>,
     pub cuda_hd_hv_h2d_ns: Option<u128>,
+    pub cuda_hd_hv_h2d_event_ns: Option<u128>,
     pub cuda_hd_alloc_ns: Option<u128>,
     pub cuda_hd_kernel_launch_ns: Option<u128>,
+    pub cuda_hd_kernel_event_ns: Option<u128>,
     pub cuda_hd_d2h_ns: Option<u128>,
+    pub cuda_hd_d2h_event_ns: Option<u128>,
 }
 
 pub struct Sketch {

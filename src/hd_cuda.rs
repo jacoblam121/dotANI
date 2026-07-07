@@ -11,9 +11,13 @@ pub(crate) const MAX_KERNEL_WARPS: usize = 8;
 pub struct GpuHdEncodeMetrics {
     pub cuda_hd_alloc_ns: u128,
     pub cuda_hd_hash_h2d_ns: u128,
+    pub cuda_hd_hash_h2d_event_ns: u128,
     pub cuda_hd_hv_h2d_ns: u128,
+    pub cuda_hd_hv_h2d_event_ns: u128,
     pub cuda_hd_kernel_launch_ns: u128,
+    pub cuda_hd_kernel_event_ns: u128,
     pub cuda_hd_d2h_ns: u128,
+    pub cuda_hd_d2h_event_ns: u128,
 }
 
 pub fn encode_hash_hd_cuda(

@@ -1,8 +1,9 @@
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use anyhow::{Result, anyhow, bail};
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,140 @@ pub fn get_fasta_files(path: &PathBuf) -> Vec<PathBuf> {
     all_files.sort();
     all_files.dedup();
     all_files
+}
+
+pub fn get_sketch_inputs(params: &SketchParams) -> Result<Vec<SketchInput>> {
+    if let Some(manifest) = &params.manifest {
+        read_sketch_manifest(manifest)
+    } else {
+        Ok(get_fasta_files(&params.path)
+            .into_iter()
+            .map(|read_path| SketchInput {
+                file_id: read_path.display().to_string(),
+                read_path,
+            })
+            .collect())
+    }
+}
+
+pub fn read_sketch_manifest(path: &Path) -> Result<Vec<SketchInput>> {
+    let contents = fs::read_to_string(path)
+        .map_err(|e| anyhow!("failed to read manifest {}: {}", path.display(), e))?;
+
+    if contents.as_bytes().contains(&0) {
+        bail!("manifest {} contains NUL bytes", path.display());
+    }
+
+    let mut header: Option<Vec<&str>> = None;
+    let mut read_path_idx = None;
+    let mut file_id_idx = None;
+    let mut inputs = Vec::new();
+    let mut seen_file_ids = HashSet::new();
+
+    for (line_idx, raw_line) in contents.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if header.is_none() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let fields: Vec<&str> = line.split('\t').collect();
+            read_path_idx = fields.iter().position(|field| *field == "read_path");
+            file_id_idx = fields.iter().position(|field| *field == "file_id");
+
+            if read_path_idx.is_none() {
+                bail!(
+                    "manifest {} is missing required read_path column",
+                    path.display()
+                );
+            }
+            if file_id_idx.is_none() {
+                bail!(
+                    "manifest {} is missing required file_id column",
+                    path.display()
+                );
+            }
+
+            header = Some(fields);
+            continue;
+        }
+
+        if line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        let header_len = header
+            .as_ref()
+            .expect("manifest header should be set")
+            .len();
+        if fields.len() != header_len {
+            bail!(
+                "manifest {} line {} has {} field(s), expected {}",
+                path.display(),
+                line_no,
+                fields.len(),
+                header_len
+            );
+        }
+
+        let read_path = fields[read_path_idx.expect("read_path column should exist")];
+        let file_id = fields[file_id_idx.expect("file_id column should exist")];
+
+        if read_path.is_empty() {
+            bail!(
+                "manifest {} line {} has empty read_path",
+                path.display(),
+                line_no
+            );
+        }
+        if file_id.is_empty() {
+            bail!(
+                "manifest {} line {} has empty file_id",
+                path.display(),
+                line_no
+            );
+        }
+        if !seen_file_ids.insert(file_id.to_string()) {
+            bail!(
+                "manifest {} line {} duplicates file_id {:?}",
+                path.display(),
+                line_no,
+                file_id
+            );
+        }
+
+        let read_path = PathBuf::from(read_path);
+        if !read_path.exists() {
+            bail!(
+                "manifest {} line {} read_path does not exist: {}",
+                path.display(),
+                line_no,
+                read_path.display()
+            );
+        }
+        if !read_path.is_file() {
+            bail!(
+                "manifest {} line {} read_path is not a file: {}",
+                path.display(),
+                line_no,
+                read_path.display()
+            );
+        }
+
+        inputs.push(SketchInput {
+            read_path,
+            file_id: file_id.to_string(),
+        });
+    }
+
+    if header.is_none() {
+        bail!("manifest {} does not contain a header row", path.display());
+    }
+
+    Ok(inputs)
 }
 
 pub fn get_progress_bar(n_file: usize) -> ProgressBar {
@@ -146,29 +281,50 @@ pub fn dump_sketch_metrics(metrics: &[FileSketchMetrics], prefix: &Path, sketch_
         summary.hashes_seen += metric.hashes_seen;
         summary.unique_hashes += metric.unique_hashes;
         summary.fasta_ns += metric.fasta_ns;
+        summary.fasta_wait_ns += metric.fasta_wait_ns;
         summary.hash_and_dedup_ns += metric.hash_and_dedup_ns;
         summary.hd_encode_ns += metric.hd_encode_ns;
         summary.hv_norm_ns += metric.hv_norm_ns;
         summary.hd_compress_ns += metric.hd_compress_ns;
         summary.total_worker_ns += metric.total_worker_ns;
         summary.cuda_h2d_ns = add_optional_ns(summary.cuda_h2d_ns, metric.cuda_h2d_ns);
+        summary.cuda_h2d_event_ns =
+            add_optional_ns(summary.cuda_h2d_event_ns, metric.cuda_h2d_event_ns);
         summary.cuda_alloc_ns = add_optional_ns(summary.cuda_alloc_ns, metric.cuda_alloc_ns);
         summary.cuda_launch_ns = add_optional_ns(summary.cuda_launch_ns, metric.cuda_launch_ns);
+        summary.cuda_kernel_event_ns =
+            add_optional_ns(summary.cuda_kernel_event_ns, metric.cuda_kernel_event_ns);
         summary.cuda_d2h_ns = add_optional_ns(summary.cuda_d2h_ns, metric.cuda_d2h_ns);
+        summary.cuda_d2h_event_ns =
+            add_optional_ns(summary.cuda_d2h_event_ns, metric.cuda_d2h_event_ns);
         summary.cuda_zero_filter_ns =
             add_optional_ns(summary.cuda_zero_filter_ns, metric.cuda_zero_filter_ns);
         summary.cuda_filter_ns = add_optional_ns(summary.cuda_filter_ns, metric.cuda_filter_ns);
         summary.cuda_hd_hash_h2d_ns =
             add_optional_ns(summary.cuda_hd_hash_h2d_ns, metric.cuda_hd_hash_h2d_ns);
+        summary.cuda_hd_hash_h2d_event_ns = add_optional_ns(
+            summary.cuda_hd_hash_h2d_event_ns,
+            metric.cuda_hd_hash_h2d_event_ns,
+        );
         summary.cuda_hd_hv_h2d_ns =
             add_optional_ns(summary.cuda_hd_hv_h2d_ns, metric.cuda_hd_hv_h2d_ns);
+        summary.cuda_hd_hv_h2d_event_ns = add_optional_ns(
+            summary.cuda_hd_hv_h2d_event_ns,
+            metric.cuda_hd_hv_h2d_event_ns,
+        );
         summary.cuda_hd_alloc_ns =
             add_optional_ns(summary.cuda_hd_alloc_ns, metric.cuda_hd_alloc_ns);
         summary.cuda_hd_kernel_launch_ns = add_optional_ns(
             summary.cuda_hd_kernel_launch_ns,
             metric.cuda_hd_kernel_launch_ns,
         );
+        summary.cuda_hd_kernel_event_ns = add_optional_ns(
+            summary.cuda_hd_kernel_event_ns,
+            metric.cuda_hd_kernel_event_ns,
+        );
         summary.cuda_hd_d2h_ns = add_optional_ns(summary.cuda_hd_d2h_ns, metric.cuda_hd_d2h_ns);
+        summary.cuda_hd_d2h_event_ns =
+            add_optional_ns(summary.cuda_hd_d2h_event_ns, metric.cuda_hd_d2h_event_ns);
     }
 
     let mut summary_tsv = String::new();
@@ -195,17 +351,18 @@ fn add_optional_ns(left: Option<u128>, right: Option<u128>) -> Option<u128> {
 }
 
 fn metrics_header() -> &'static str {
-    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_d2h_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_d2h_ns"
+    "file\tinput_bases\thashes_seen\tunique_hashes\tfasta_ns\tfasta_wait_ns\thash_and_dedup_ns\thd_encode_ns\thv_norm_ns\thd_compress_ns\ttotal_worker_ns\tsketch_wall_ns\tcuda_stream_lane\tcuda_device_id\tcuda_h2d_ns\tcuda_h2d_event_ns\tcuda_alloc_ns\tcuda_launch_ns\tcuda_kernel_event_ns\tcuda_d2h_ns\tcuda_d2h_event_ns\tcuda_zero_filter_ns\tcuda_filter_ns\tcuda_hd_hash_h2d_ns\tcuda_hd_hash_h2d_event_ns\tcuda_hd_hv_h2d_ns\tcuda_hd_hv_h2d_event_ns\tcuda_hd_alloc_ns\tcuda_hd_kernel_launch_ns\tcuda_hd_kernel_event_ns\tcuda_hd_d2h_ns\tcuda_hd_d2h_event_ns"
 }
 
 fn metric_row(metric: &FileSketchMetrics) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         metric.file,
         metric.input_bases,
         metric.hashes_seen,
         metric.unique_hashes,
         metric.fasta_ns,
+        metric.fasta_wait_ns,
         metric.hash_and_dedup_ns,
         metric.hd_encode_ns,
         metric.hv_norm_ns,
@@ -215,16 +372,23 @@ fn metric_row(metric: &FileSketchMetrics) -> String {
         optional_usize(metric.cuda_stream_lane),
         optional_usize(metric.cuda_device_id),
         optional_ns(metric.cuda_h2d_ns),
+        optional_ns(metric.cuda_h2d_event_ns),
         optional_ns(metric.cuda_alloc_ns),
         optional_ns(metric.cuda_launch_ns),
+        optional_ns(metric.cuda_kernel_event_ns),
         optional_ns(metric.cuda_d2h_ns),
+        optional_ns(metric.cuda_d2h_event_ns),
         optional_ns(metric.cuda_zero_filter_ns),
         optional_ns(metric.cuda_filter_ns),
         optional_ns(metric.cuda_hd_hash_h2d_ns),
+        optional_ns(metric.cuda_hd_hash_h2d_event_ns),
         optional_ns(metric.cuda_hd_hv_h2d_ns),
+        optional_ns(metric.cuda_hd_hv_h2d_event_ns),
         optional_ns(metric.cuda_hd_alloc_ns),
         optional_ns(metric.cuda_hd_kernel_launch_ns),
-        optional_ns(metric.cuda_hd_d2h_ns)
+        optional_ns(metric.cuda_hd_kernel_event_ns),
+        optional_ns(metric.cuda_hd_d2h_ns),
+        optional_ns(metric.cuda_hd_d2h_event_ns)
     )
 }
 
@@ -335,5 +499,141 @@ pub fn dump_distribution_to_txt(path: &Path) {
 
     for kv in hist {
         println!("{}\t{}", kv.0, kv.1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "dotani_manifest_test_{}_{}_{}",
+            std::process::id(),
+            name,
+            unique
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn manifest_preserves_row_order_and_ids() {
+        let dir = test_dir("order");
+        let a = dir.join("a.fna");
+        let b = dir.join("b.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(&b, ">b\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!(
+                "# version=1\nread_path\tfile_id\trel_path\n{}\tgenome-b\tb.fna\n{}\tgenome-a\ta.fna\n",
+                b.display(),
+                a.display()
+            ),
+        )
+        .unwrap();
+
+        let inputs = read_sketch_manifest(&manifest).unwrap();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].read_path, b);
+        assert_eq!(inputs[0].file_id, "genome-b");
+        assert_eq!(inputs[1].read_path, a);
+        assert_eq!(inputs[1].file_id, "genome-a");
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_file_ids() {
+        let dir = test_dir("duplicate");
+        let a = dir.join("a.fna");
+        let b = dir.join("b.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(&b, ">b\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!(
+                "read_path\tfile_id\n{}\tgenome\n{}\tgenome\n",
+                a.display(),
+                b.display()
+            ),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("duplicate IDs should fail");
+
+        assert!(err.to_string().contains("duplicates file_id"));
+    }
+
+    #[test]
+    fn manifest_rejects_malformed_rows() {
+        let dir = test_dir("malformed");
+        let a = dir.join("a.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\textra\n", a.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("malformed rows should fail");
+
+        assert!(err.to_string().contains("expected 2"));
+    }
+
+    #[test]
+    fn manifest_rejects_missing_read_paths() {
+        let dir = test_dir("missing");
+        let missing = dir.join("missing.fna");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\n", missing.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("missing read_path should fail");
+
+        assert!(err.to_string().contains("read_path does not exist"));
+    }
+
+    #[test]
+    fn manifest_rejects_directory_read_paths() {
+        let dir = test_dir("directory");
+        let manifest = dir.join("manifest.tsv");
+        fs::write(
+            &manifest,
+            format!("read_path\tfile_id\n{}\tgenome\n", dir.display()),
+        )
+        .unwrap();
+
+        let err = read_sketch_manifest(&manifest).expect_err("directory read_path should fail");
+
+        assert!(err.to_string().contains("read_path is not a file"));
+    }
+
+    #[test]
+    fn path_mode_uses_path_as_file_id() {
+        let dir = test_dir("path_mode");
+        let a = dir.join("a.fna");
+        fs::write(&a, ">a\nACGT\n").unwrap();
+        let params = SketchParams {
+            path: dir,
+            ..SketchParams::default()
+        };
+
+        let inputs = get_sketch_inputs(&params).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].read_path, a);
+        assert_eq!(inputs[0].file_id, a.display().to_string());
     }
 }
